@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "steam-cli"
-version = "1.0.0"
-description = "Query the public Steam API (reviews, info, prices, players, news, achievements). Stdlib-only Python 3 CLI."
+version = "1.1.0"
+description = "Query the public Steam API (overview, reviews, info, prices, players, news, achievements). Stdlib-only Python 3 CLI."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -23,6 +23,9 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
 [project.urls]
 Homepage = "https://github.com/dim-s/steam-cli"
 Issues = "https://github.com/dim-s/steam-cli/issues"
@@ -33,3 +36,6 @@ steam-cli = "steam_cli:main"
 
 [tool.setuptools]
 py-modules = ["steam_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

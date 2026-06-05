@@ -34,17 +34,32 @@ Every `<game>` is an **appid** (`1145360`) or a **name** (`"Hades"`,
 resolved via store search — the chosen appid is printed to stderr).
 
 ```bash
+# one-shot snapshot: info + review score + live players + price in one call
+steam-cli overview "Hades" --json
+
+# full profile in one call: also fold in news and top achievements
+steam-cli overview "Hades" --news 3 --top-achievements 5 --json
+
 # quick sentiment: score + totals, no download
 steam-cli reviews "Hades" --summary
 
 # 200 recent English reviews as JSON for an agent to digest
 steam-cli reviews 1145360 -n 200 --language english --json
 
+# recent reviews, but only from players with 20+ hours, since this year
+steam-cli reviews 1145360 -n 200 --min-playtime 20 --since 2025-01-01 --json
+
 # everything to a file
 steam-cli reviews 1145360 --all --output hades-reviews.json
 
 # store card: genres, release, devs, metacritic, price
 steam-cli info "Baldur's Gate 3"
+
+# …with DLC, screenshots and system requirements
+steam-cli info "Baldur's Gate 3" --dlc --screenshots --sysreqs
+
+# download header + screenshots so an agent can *see* the game
+steam-cli images 1145360 --what header screenshots --limit 4 --out ./media
 
 # resolve a name to appid candidates
 steam-cli search "elden ring"
@@ -58,24 +73,34 @@ steam-cli news 1145360 -c 5
 # global achievement completion %
 steam-cli achievements 1145360
 
-# price in a specific region
-steam-cli price 1145360 --cc de
+# compare price across regions in one call
+steam-cli price 1145360 --cc us,de,ru,br
 ```
 
 ## Subcommands
 
 | Command | Purpose | Steam endpoint |
 |---|---|---|
+| `overview <game>` | Snapshot: info + review score + players + price, one call | `appdetails` + `appreviews` + `GetNumberOfCurrentPlayers` |
 | `reviews <game>` | User reviews + aggregate score | `store/appreviews` |
 | `info <game>` | Store details (genres, devs, metacritic, price…) | `store/api/appdetails` |
+| `images <game>` | Download header / screenshots / art to local files | `appdetails` + Steam CDN |
 | `search <term>` | Name → appid candidates | `store/api/storesearch` |
 | `players <game>` | Current concurrent players | `ISteamUserStats/GetNumberOfCurrentPlayers` |
 | `news <game>` | News / patch notes | `ISteamNews/GetNewsForApp` |
 | `achievements <game>` | Global achievement completion % | `…/GetGlobalAchievementPercentagesForApp` |
-| `price <game>` | Price + discount for a region | `store/api/appdetails` |
+| `price <game>` | Price + discount for one or more regions | `store/api/appdetails` |
+| `cache [--path/--clear]` | Inspect or clear the on-disk cache | — (local) |
 
 Add `--json` to any subcommand for raw structured output (ideal for scripts
-and agents). Add `-q/--quiet` to suppress the appid-resolution note.
+and agents). Add `-q/--quiet` to suppress the appid-resolution note. All
+subcommands accept `--timeout SECS` (default 30) and retry transient HTTP
+429/5xx and network errors automatically with backoff.
+
+Under `--json`, failures are reported as a JSON object on **stdout** —
+`{"error": "<message>", "code": "<not_found|http|network|parse>"}` — with a
+non-zero exit code, so a parser always gets valid JSON instead of an empty
+stream.
 
 ### `reviews` options
 
@@ -90,9 +115,62 @@ and agents). Add `-q/--quiet` to suppress the appid-resolution note.
 | `--filter` | `recent` | `recent` / `updated` (paginate) or `all` (by helpfulness within `--day-range`) |
 | `--day-range N` | — | Window for `--filter all` (1–365) |
 | `--offtopic` | off | Include review-bomb (off-topic) activity |
+| `--min-playtime HOURS` | — | Keep only reviews whose author had ≥ HOURS at review time |
+| `--since YYYY-MM-DD` | — | Keep only reviews created on/after this date |
 | `--jsonl` | off | One review JSON object per line |
 | `--output FILE` | stdout | Write to a file |
 | `--delay SECS` | `0.3` | Pause between pages (politeness) |
+
+## Language & country codes
+
+`--lang` / `--language` and `--cc` accept flexible input and normalize it to
+what Steam actually expects, so you get the data you asked for instead of a
+silent wrong answer:
+
+- **Language**: pass an ISO code (`en`, `ru`, `ko`, `zh`, `pt-br`, `zh-tw`) or
+  a Steam name (`english`, `russian`, `koreana`, `schinese`, `brazilian`). A
+  raw ISO code like `ru` sent straight to Steam would silently fall back to
+  English — normalization maps it to `russian` so store text is really
+  localized. `reviews --language all` is preserved.
+- **Country**: pass alpha-2 (`us`), alpha-3 (`usa`), or a common alias
+  (`uk`→`gb`). A wrong code like `usa` sent raw returns a *wrong* price, not an
+  error — normalization fixes it to `us`.
+- **Unknown codes are a hard error** with a hint (`unrecognized language 'germ';
+  did you mean "german"?`) and exit code 1 — never quietly-wrong data.
+
+```bash
+steam-cli info "Hades" --lang ru          # Russian store text
+steam-cli reviews "Hades" --language ko   # Korean reviews
+steam-cli price "Hades" --cc usa,uk,br    # normalized to us, gb, br
+```
+
+## Caching
+
+Responses and downloaded images are cached on disk so repeated queries are
+near-instant and don't re-hit Steam. The cache directory is platform-native
+(override with `STEAM_CLI_CACHE_DIR`):
+
+| OS | Default cache directory |
+|---|---|
+| Linux | `$XDG_CACHE_HOME/steam-cli` or `~/.cache/steam-cli` |
+| macOS | `~/Library/Caches/steam-cli` |
+| Windows | `%LOCALAPPDATA%\steam-cli\cache` |
+
+Freshness rules: JSON responses are cached for **6 hours**; downloaded images
+are cached **forever** (their URLs carry a `?t=` version stamp, so a changed
+asset is a new URL); **live player counts and review pages are never cached**.
+
+Per-command overrides (all subcommands): `--no-cache` (always fetch fresh,
+don't write), `--refresh` (ignore cached entries but refresh them), `--cache-ttl
+SECS` (custom JSON freshness). Set `STEAM_CLI_NO_CACHE=1` to disable globally.
+
+Manage the cache:
+
+```bash
+steam-cli cache            # show its location and size
+steam-cli cache --path     # print just the directory (script-friendly)
+steam-cli cache --clear    # delete all cached files
+```
 
 ## TLS interception / corporate proxies
 
