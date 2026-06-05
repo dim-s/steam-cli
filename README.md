@@ -20,6 +20,13 @@ pip install git+https://github.com/dim-s/steam-cli.git
 `pip` creates a `steam-cli` executable on your PATH. To upgrade, add `-U`.
 Alternatives: `pipx install …` (isolated) or `uv tool install …` (fastest).
 
+**With uv, no install** — the script has PEP 723 inline metadata:
+
+```bash
+uvx --from git+https://github.com/dim-s/steam-cli.git steam-cli reviews "Hades" --summary
+uv run steam_cli.py reviews "Hades" --summary   # single file, from a checkout
+```
+
 **Manual** (single file, no install):
 
 ```bash
@@ -49,8 +56,11 @@ steam-cli reviews 1145360 -n 200 --language english --json
 # recent reviews, but only from players with 20+ hours, since this year
 steam-cli reviews 1145360 -n 200 --min-playtime 20 --since 2025-01-01 --json
 
-# everything to a file
-steam-cli reviews 1145360 --all --output hades-reviews.json
+# everything to a JSON file
+steam-cli reviews 1145360 --all --json --output hades-reviews.json
+
+# everything to a CSV for Excel / Numbers / Sheets
+steam-cli reviews 1145360 --all --csv --output hades-reviews.csv
 
 # store card: genres, release, devs, metacritic, price
 steam-cli info "Baldur's Gate 3"
@@ -75,6 +85,13 @@ steam-cli achievements 1145360
 
 # compare price across regions in one call
 steam-cli price 1145360 --cc us,de,ru,br
+
+# what's on sale / what's selling right now
+steam-cli specials
+steam-cli top-sellers
+
+# public profile of a Steam user (e.g. a reviewer's author.steamid)
+steam-cli profile 76561197960287930
 ```
 
 ## Subcommands
@@ -90,6 +107,9 @@ steam-cli price 1145360 --cc us,de,ru,br
 | `news <game>` | News / patch notes | `ISteamNews/GetNewsForApp` |
 | `achievements <game>` | Global achievement completion % | `…/GetGlobalAchievementPercentagesForApp` |
 | `price <game>` | Price + discount for one or more regions | `store/api/appdetails` |
+| `specials` | Games currently on sale (featured specials) | `store/api/featuredcategories` |
+| `top-sellers` | Current top-selling games | `store/api/featuredcategories` |
+| `profile <id>` | Public Steam Community profile (no key) | `steamcommunity.com/…?xml=1` |
 | `cache [--path/--clear]` | Inspect or clear the on-disk cache | — (local) |
 
 Add `--json` to any subcommand for raw structured output (ideal for scripts
@@ -118,6 +138,7 @@ stream.
 | `--min-playtime HOURS` | — | Keep only reviews whose author had ≥ HOURS at review time |
 | `--since YYYY-MM-DD` | — | Keep only reviews created on/after this date |
 | `--jsonl` | off | One review JSON object per line |
+| `--csv` | off | Flat CSV for Excel / Numbers / Sheets (UTF-8 BOM when written to a file) |
 | `--output FILE` | stdout | Write to a file |
 | `--delay SECS` | `0.3` | Pause between pages (politeness) |
 

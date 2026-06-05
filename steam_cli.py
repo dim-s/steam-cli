@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.8"
+# dependencies = []
+# ///
 """steam-cli — query the public Steam API (no API key needed).
 
 Subcommands: reviews, info, search, players, news, achievements, price.
@@ -9,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import csv
 import hashlib
 import html
 import json
@@ -23,11 +28,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
+COMMUNITY = "https://steamcommunity.com"
 USER_AGENT = f"steam-cli/{__version__} (+https://github.com/dim-s/steam-cli)"
 
 
@@ -491,7 +498,74 @@ def _review_summary(appid: int, *, language: str = "all", review_type: str = "al
     return data.get("query_summary", {})
 
 
+_REVIEW_CSV_COLUMNS = [
+    "recommendationid", "sentiment", "date",
+    "playtime_at_review_hours", "playtime_forever_hours",
+    "votes_up", "votes_funny", "weighted_vote_score", "comment_count",
+    "steam_purchase", "received_for_free", "language",
+    "author_steamid", "author_num_reviews", "review",
+]
+
+
+def _csv_cell(v):
+    """Neutralize spreadsheet formula injection from user-controlled text:
+    a review can start with =/+/-/@ and would execute on open in Excel/Sheets."""
+    if isinstance(v, str) and v and v[0] in "=+-@|\t\r":
+        return "'" + v
+    return v
+
+
+def _review_to_row(r: dict) -> dict:
+    a = r.get("author", {}) or {}
+    voted = r.get("voted_up")
+    return {
+        "recommendationid": r.get("recommendationid"),
+        "sentiment": "positive" if voted is True else ("negative" if voted is False else ""),
+        "date": _ts(r.get("timestamp_created")),
+        "playtime_at_review_hours": round((a.get("playtime_at_review") or 0) / 60, 1),
+        "playtime_forever_hours": round((a.get("playtime_forever") or 0) / 60, 1),
+        "votes_up": r.get("votes_up"),
+        "votes_funny": r.get("votes_funny"),
+        "weighted_vote_score": r.get("weighted_vote_score"),
+        "comment_count": r.get("comment_count"),
+        # 1/0, not Python "True"/"False" — spreadsheets treat those as text
+        "steam_purchase": 1 if r.get("steam_purchase") else 0,
+        "received_for_free": 1 if r.get("received_for_free") else 0,
+        "language": r.get("language"),
+        "author_steamid": a.get("steamid"),
+        "author_num_reviews": a.get("num_reviews"),
+        # flatten whitespace so each review is one tidy single-line cell
+        "review": " ".join((r.get("review") or "").split()),
+    }
+
+
+def _dump_reviews_csv(fh, reviews: list[dict], lineterminator: str) -> None:
+    w = csv.DictWriter(fh, fieldnames=_REVIEW_CSV_COLUMNS,
+                       lineterminator=lineterminator)
+    w.writeheader()
+    for r in reviews:
+        w.writerow({k: _csv_cell(v) for k, v in _review_to_row(r).items()})
+
+
+def _write_reviews_csv(reviews: list[dict], output_path: str | None) -> None:
+    if output_path:
+        # utf-8-sig writes a BOM so Excel detects UTF-8; newline="" + the
+        # explicit \r\n terminator give clean Excel rows without CRLF doubling.
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as fh:
+            _dump_reviews_csv(fh, reviews, "\r\n")
+        print(f"written to {output_path}", file=sys.stderr)
+    else:
+        # stdout: no BOM (breaks pipes); plain \n avoids \r\r\n on Windows text
+        # streams while staying pipe/grep-friendly.
+        _dump_reviews_csv(sys.stdout, reviews, "\n")
+
+
 def cmd_reviews(args) -> int:
+    if sum((args.json, args.jsonl, args.csv)) > 1:
+        raise SteamError("pick one output format: --json, --jsonl, or --csv",
+                         code="invalid")
+    if args.csv and args.summary:
+        raise SteamError("--csv needs the review list; drop --summary", code="invalid")
     args.cc = normalize_country(args.cc)
     args.language = normalize_language(args.language)
     appid = resolve_appid(args.game, cc=args.cc, lang="en",
@@ -506,7 +580,8 @@ def cmd_reviews(args) -> int:
                                   offtopic=args.offtopic,
                                   insecure=args.insecure, timeout=args.timeout)
         if args.json:
-            _emit_json({"appid": appid, "query_summary": summary})
+            _write_out(args.output,
+                       lambda: _emit_json({"appid": appid, "query_summary": summary}))
             return 0
         _print_review_summary(appid, summary, args.language)
         return 0
@@ -555,9 +630,13 @@ def cmd_reviews(args) -> int:
                   f"(applied to the fetched window; raise -n or use --all for more)",
                   file=sys.stderr)
 
+    if args.csv:
+        _write_reviews_csv(collected, args.output)
+        return 0
     if args.json:
-        _emit_json({"appid": appid, "query_summary": summary,
-                    "count": len(collected), "reviews": collected})
+        _write_out(args.output, lambda: _emit_json({
+            "appid": appid, "query_summary": summary,
+            "count": len(collected), "reviews": collected}))
         return 0
     if args.jsonl:
         _write_out(args.output, lambda: [print(json.dumps(r, ensure_ascii=False))
@@ -1120,6 +1199,147 @@ def cmd_cache(args) -> int:
     return 0
 
 
+# ----- subcommands: specials / top-sellers ---------------------------------
+# Both read the storefront's featuredcategories (key-free, region-curated front
+# page) and surface one section each. Prices are integer minor units (cents).
+
+def _featured_section(section: str, cc: str, lang: str, *, insecure: bool = False,
+                      timeout: float = 30.0) -> list[dict]:
+    data = http_json(f"{STORE}/api/featuredcategories", {"cc": cc, "l": lang},
+                     timeout=timeout, insecure=insecure)
+    items = (data.get(section) or {}).get("items", []) or []
+    return [{
+        "id": it.get("id"),
+        "name": it.get("name"),
+        "discounted": it.get("discounted"),
+        "discount_percent": it.get("discount_percent"),
+        "original_price": it.get("original_price"),
+        "final_price": it.get("final_price"),
+        "currency": it.get("currency"),
+        "header_image": it.get("header_image"),
+    } for it in items]
+
+
+def _run_featured(args, section: str, label: str) -> int:
+    cc = normalize_country(args.cc)
+    lang = normalize_language(args.lang)
+    items = _featured_section(section, cc, lang, insecure=args.insecure,
+                              timeout=args.timeout)
+    if args.limit and args.limit > 0:
+        items = items[: args.limit]
+    if args.json:
+        _emit_json({"section": section, "cc": cc, "count": len(items),
+                    "items": items})
+        return 0
+    print(f"{label}  [cc={cc}]  ({len(items)})\n")
+    for it in items:
+        price = it.get("final_price")
+        if price is None:
+            ptxt = "—"                       # price unknown
+        elif price == 0:
+            ptxt = "free"                     # genuinely free (0 cents)
+        else:
+            ptxt = f"{price / 100:.2f} {it.get('currency', '')}"
+        if it.get("discount_percent"):
+            ptxt += f"  (-{it['discount_percent']}%)"
+        print(f"{str(it.get('id') or '?'):>8}  {it.get('name', '?')}  —  {ptxt}")
+    return 0
+
+
+def cmd_specials(args) -> int:
+    return _run_featured(args, "specials", "On sale now (featured specials)")
+
+
+def cmd_top_sellers(args) -> int:
+    return _run_featured(args, "top_sellers", "Top sellers")
+
+
+# ----- subcommand: profile -------------------------------------------------
+# Public Steam Community profiles via the key-free ?xml=1 endpoint. Public data
+# only — owned-games libraries and per-user achievements still need a Web API
+# key and stay out of scope. A reviewer's steamid (review.author.steamid) feeds
+# straight in, so an agent can look up who wrote a review.
+
+def _profile_url(ident: str) -> str:
+    ident = ident.strip()
+    if "steamcommunity.com" in ident:        # accept a pasted profile URL
+        # urlparse drops any ?query / #fragment so they can't leak into the id
+        ident = urllib.parse.urlparse(ident).path.strip("/").rsplit("/", 1)[-1]
+    ident = ident.strip("/")
+    if not ident:
+        raise SteamError("profile id is empty; pass a steamID64 or vanity name",
+                         code="invalid")
+    if ident.isdigit() and len(ident) == 17:
+        return f"{COMMUNITY}/profiles/{ident}/?xml=1"
+    return f"{COMMUNITY}/id/{urllib.parse.quote(ident)}/?xml=1"
+
+
+def _parse_profile_xml(raw: bytes) -> dict:
+    # Steam's profile XML never carries a DTD; reject one rather than feed it
+    # to expat, which would otherwise expand internal entities (billion-laughs)
+    # from a MITM or compromised response. External entities are already off.
+    if b"<!DOCTYPE" in raw or b"<!ENTITY" in raw:
+        raise SteamError("profile response contained an unexpected DTD", code="parse")
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as e:
+        raise SteamError(f"could not parse profile XML: {e}", code="parse")
+    if root.tag == "response":               # bad vanity / missing profile
+        raise SteamError(root.findtext("error") or "profile not found",
+                         code="not_found")
+
+    def text(tag):
+        el = root.find(tag)
+        return el.text if el is not None and el.text else None
+
+    summary = text("summary")
+    sid = text("steamID64")
+    return {
+        "steamid64": sid,
+        "name": text("steamID"),
+        "private": text("privacyState") != "public",
+        "privacy_state": text("privacyState"),
+        "online_state": text("onlineState"),
+        "state_message": text("stateMessage"),
+        "member_since": text("memberSince"),
+        "location": text("location"),
+        "real_name": text("realname"),
+        "summary": _strip_html(summary) if summary else None,
+        "vac_banned": text("vacBanned") == "1",
+        "avatar": text("avatarFull"),
+        "profile_url": f"{COMMUNITY}/profiles/{sid}" if sid else None,
+    }
+
+
+def cmd_profile(args) -> int:
+    raw = http_get(_profile_url(args.user), timeout=args.timeout,
+                   insecure=args.insecure, cache_ttl=DEFAULT_TTL)
+    prof = _parse_profile_xml(raw)
+    if args.json:
+        _emit_json(prof)
+        return 0
+    _print_profile(prof)
+    return 0
+
+
+def _print_profile(p: dict) -> None:
+    print(f"{p.get('name') or '?'}  ({p.get('steamid64')})")
+    if p.get("private"):
+        print(f"Profile:     private ({p.get('privacy_state')})")
+    print(f"Status:      {p.get('state_message') or p.get('online_state') or '—'}")
+    if p.get("member_since"):
+        print(f"Member since:{p['member_since']}")
+    if p.get("location"):
+        print(f"Location:    {p['location']}")
+    if p.get("real_name"):
+        print(f"Real name:   {p['real_name']}")
+    print(f"VAC banned:  {'yes' if p.get('vac_banned') else 'no'}")
+    if p.get("summary"):
+        print(f"\n{_flatten(p['summary'], 300)}")
+    if p.get("profile_url"):
+        print(f"\n{p['profile_url']}")
+
+
 # ----- argument parser -----------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1185,6 +1405,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds between pages (default 0.3)")
     r.add_argument("--jsonl", action="store_true",
                    help="one review JSON object per line")
+    r.add_argument("--csv", action="store_true",
+                   help="emit reviews as CSV (with --output: UTF-8 BOM for Excel)")
     r.add_argument("--output", help="write to FILE instead of stdout")
     r.add_argument("--cc", default="us", help="country code for name resolution")
     add_common(r)
@@ -1264,6 +1486,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output directory (default ./steam-<appid>-media/)")
     add_common(im)
     im.set_defaults(func=cmd_images)
+
+    # specials / top-sellers
+    for name, fn, helptext in (
+        ("specials", cmd_specials, "games currently on sale (featured specials)"),
+        ("top-sellers", cmd_top_sellers, "current top-selling games"),
+    ):
+        fp = sub.add_parser(name, help=helptext)
+        fp.add_argument("--cc", default="us", help="country code (region for prices)")
+        fp.add_argument("--lang", default="english", help="store language")
+        fp.add_argument("--limit", type=int, default=0,
+                        help="cap the list (0 = all returned)")
+        add_common(fp)
+        fp.set_defaults(func=fn)
+
+    # profile
+    pf = sub.add_parser("profile",
+                        help="public Steam Community profile (no key; public only)")
+    pf.add_argument("user", help="steamID64 (17 digits), vanity name, or profile URL")
+    add_common(pf)
+    pf.set_defaults(func=cmd_profile)
 
     # cache
     ca = sub.add_parser("cache", help="show or clear the on-disk cache")

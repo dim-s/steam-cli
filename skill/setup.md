@@ -20,6 +20,19 @@ pipx install git+https://github.com/dim-s/steam-cli.git
 uv tool install git+https://github.com/dim-s/steam-cli.git
 ```
 
+### uv without installing
+
+`steam_cli.py` carries PEP 723 inline metadata, so `uv` can run it with zero
+install:
+
+```bash
+# run the published package as a one-off (no install)
+uvx --from git+https://github.com/dim-s/steam-cli.git steam-cli reviews "Hades" --summary
+
+# run the single file directly (after curl-ing it, or from a checkout)
+uv run steam_cli.py reviews "Hades" --summary
+```
+
 ### Local checkout
 
 If the repo is already cloned (e.g. `~/dev/steam-cli`), install from the
@@ -32,7 +45,7 @@ pip install -e ~/dev/steam-cli
 ## Verify
 
 ```bash
-steam-cli --version   # → steam-cli 1.1.0
+steam-cli --version   # → steam-cli 1.2.0
 steam-cli --help
 ```
 

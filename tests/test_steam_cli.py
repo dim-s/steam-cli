@@ -493,6 +493,17 @@ class TestReviews:
         assert "▲" in out
         assert "· english" in out   # language tag shown when --language all (default)
 
+    def test_json_honors_output_file(self, stub_json, tmp_path, capsys):
+        # --json + --output must write the JSON to the file, not silently to stdout
+        stub_json([review_page([review(1), review(2)], cursor="C1")])
+        path = tmp_path / "r.json"
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1145360", "-n", "2", "--delay", "0", "--json",
+             "--output", str(path)]))
+        assert capsys.readouterr().out == ""          # nothing leaked to stdout
+        d = json.loads(path.read_text(encoding="utf-8"))
+        assert d["count"] == 2 and d["reviews"][0]["recommendationid"] == "1"
+
 
 # --------------------------------------------------------------------------- #
 # command: info                                                                #
@@ -1603,3 +1614,229 @@ class TestNormalizeIntegration:
         assert steam_cli.normalize_language("chinese") == "schinese"
         assert steam_cli.normalize_language("korean") == "koreana"
         assert steam_cli.normalize_language("Traditional-Chinese") == "tchinese"
+
+
+# --------------------------------------------------------------------------- #
+# commands: specials / top-sellers                                             #
+# --------------------------------------------------------------------------- #
+
+def _featured_resp():
+    return {
+        "specials": {"items": [
+            {"id": 1, "name": "Game A", "discounted": True, "discount_percent": 50,
+             "original_price": 2000, "final_price": 1000, "currency": "USD",
+             "header_image": "http://img/a"},
+        ]},
+        "top_sellers": {"items": [
+            {"id": 2, "name": "Game B", "discounted": False, "discount_percent": 0,
+             "original_price": 3000, "final_price": 3000, "currency": "USD",
+             "header_image": "http://img/b"},
+        ]},
+    }
+
+
+class TestSpecialsTop:
+    def test_specials_json(self, stub_json, capsys):
+        stub_json(_featured_resp())
+        steam_cli.cmd_specials(make_args(["specials", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["section"] == "specials"
+        assert d["count"] == 1
+        assert d["items"][0]["name"] == "Game A"
+        assert d["items"][0]["discount_percent"] == 50
+
+    def test_top_sellers_json(self, stub_json, capsys):
+        stub_json(_featured_resp())
+        steam_cli.cmd_top_sellers(make_args(["top-sellers", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["section"] == "top_sellers"
+        assert d["items"][0]["name"] == "Game B"
+
+    def test_limit_caps(self, stub_json, capsys):
+        stub_json({"specials": {"items": [{"id": i, "name": f"G{i}"} for i in range(10)]}})
+        steam_cli.cmd_specials(make_args(["specials", "--limit", "3", "--json"]))
+        assert json.loads(capsys.readouterr().out)["count"] == 3
+
+    def test_normalizes_cc(self, stub_json):
+        stub = stub_json(_featured_resp())
+        steam_cli.cmd_specials(make_args(["specials", "--cc", "usa", "--json"]))
+        assert stub.calls[0].params["cc"] == "us"    # usa -> us
+
+    def test_text_render_shows_discount(self, stub_json, capsys):
+        stub_json(_featured_resp())
+        steam_cli.cmd_specials(make_args(["specials"]))
+        out = capsys.readouterr().out
+        assert "Game A" in out and "-50%" in out
+
+    def test_free_vs_unknown_price(self, stub_json, capsys):
+        stub_json({"specials": {"items": [
+            {"id": 1, "name": "FreeGame", "final_price": 0, "currency": "USD"},
+            {"id": 2, "name": "NoPrice"},   # final_price absent → unknown
+        ]}})
+        steam_cli.cmd_specials(make_args(["specials"]))
+        out = capsys.readouterr().out
+        assert "FreeGame  —  free" in out      # 0 cents → free, not "free/—"
+        assert "NoPrice  —  —" in out          # missing → unknown dash
+
+    def test_text_render_missing_id_does_not_crash(self, stub_json, capsys):
+        # an item without 'id' must not blow up the width-formatted text render
+        stub_json({"specials": {"items": [{"name": "NoId", "final_price": 500,
+                                           "currency": "USD"}]}})
+        steam_cli.cmd_specials(make_args(["specials"]))
+        assert "NoId" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# command: profile                                                             #
+# --------------------------------------------------------------------------- #
+
+PUBLIC_XML = b"""<?xml version="1.0"?>
+<profile>
+  <steamID64>76561190000000000</steamID64>
+  <steamID>Tester</steamID>
+  <onlineState>online</onlineState>
+  <stateMessage>Online</stateMessage>
+  <privacyState>public</privacyState>
+  <memberSince>January 1, 2020</memberSince>
+  <location>Berlin, Germany</location>
+  <realname>Real Name</realname>
+  <summary>Hello &amp; &lt;b&gt;welcome&lt;/b&gt;</summary>
+  <vacBanned>0</vacBanned>
+  <avatarFull>http://img/full.jpg</avatarFull>
+</profile>"""
+
+PRIVATE_XML = b"""<?xml version="1.0"?>
+<profile>
+  <steamID64>76561190000000001</steamID64>
+  <steamID>Secret</steamID>
+  <onlineState>offline</onlineState>
+  <privacyState>private</privacyState>
+</profile>"""
+
+ERROR_XML = (b'<?xml version="1.0"?>\n<response>'
+             b'<error>The specified profile could not be found.</error></response>')
+
+
+class TestProfile:
+    def test_public_profile_json(self, monkeypatch, capsys):
+        monkeypatch.setattr(steam_cli, "http_get",
+                            lambda url, timeout=30.0, insecure=False, cache_ttl=0: PUBLIC_XML)
+        steam_cli.cmd_profile(make_args(["profile", "76561190000000000", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["name"] == "Tester"
+        assert d["private"] is False
+        assert d["location"] == "Berlin, Germany"
+        assert d["summary"] == "Hello & welcome"          # entities + tags handled
+        assert d["profile_url"].endswith("76561190000000000")
+
+    def test_private_profile_marked(self, monkeypatch, capsys):
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: PRIVATE_XML)
+        steam_cli.cmd_profile(make_args(["profile", "76561190000000001", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["private"] is True
+        assert d["location"] is None                       # not visible when private
+        assert d["name"] == "Secret"
+
+    def test_missing_profile_errors(self, monkeypatch):
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: ERROR_XML)
+        with pytest.raises(steam_cli.SteamError, match="could not be found") as ei:
+            steam_cli.cmd_profile(make_args(["profile", "nobody", "--json"]))
+        assert ei.value.code == "not_found"
+
+    def test_steamid64_routes_to_profiles(self):
+        url = steam_cli._profile_url("76561190000000000")
+        assert "/profiles/76561190000000000" in url and url.endswith("?xml=1")
+
+    def test_vanity_routes_to_id(self):
+        assert "/id/gabelogannewell" in steam_cli._profile_url("gabelogannewell")
+
+    def test_accepts_pasted_profile_url(self):
+        assert "/id/someone" in steam_cli._profile_url(
+            "https://steamcommunity.com/id/someone/")
+
+    def test_url_with_query_string_does_not_leak(self):
+        # ?tab=games must not end up inside the vanity id
+        url = steam_cli._profile_url("https://steamcommunity.com/id/gaben?tab=games")
+        assert "/id/gaben/?xml=1" in url and "tab=games" not in url
+
+    def test_empty_user_raises_invalid(self):
+        with pytest.raises(steam_cli.SteamError, match="empty") as ei:
+            steam_cli._profile_url("   ")
+        assert ei.value.code == "invalid"
+
+    def test_doctype_rejected(self, monkeypatch):
+        bomb = (b'<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY a "AAAA">]>'
+                b'<profile><steamID>x</steamID></profile>')
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: bomb)
+        with pytest.raises(steam_cli.SteamError, match="DTD"):
+            steam_cli.cmd_profile(make_args(["profile", "76561190000000000", "--json"]))
+
+
+# --------------------------------------------------------------------------- #
+# reviews --csv export                                                         #
+# --------------------------------------------------------------------------- #
+
+import csv as _csv
+
+
+class TestReviewsCsv:
+    def test_csv_to_file_has_bom_and_parses(self, stub_json, tmp_path):
+        stub_json([review_page([review(1, up=True), review(2, up=False)], cursor="C1")])
+        path = tmp_path / "r.csv"
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "2", "--delay", "0", "--csv", "--output", str(path)]))
+        assert path.read_bytes().startswith(b"\xef\xbb\xbf")     # Excel UTF-8 BOM
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+        assert [r["recommendationid"] for r in rows] == ["1", "2"]
+        assert rows[0]["sentiment"] == "positive"
+        assert rows[1]["sentiment"] == "negative"
+        assert set(rows[0].keys()) == set(steam_cli._REVIEW_CSV_COLUMNS)
+
+    def test_csv_booleans_are_numeric_not_text(self, stub_json, tmp_path):
+        rev = review(1)
+        rev["steam_purchase"] = True
+        rev["received_for_free"] = False
+        stub_json([review_page([rev], cursor="C1")])
+        path = tmp_path / "r.csv"
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "1", "--delay", "0", "--csv", "--output", str(path)]))
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            row = next(_csv.DictReader(fh))
+        # 1/0, not "True"/"False" — spreadsheets filter/sort these as numbers
+        assert row["steam_purchase"] == "1"
+        assert row["received_for_free"] == "0"
+
+    def test_csv_to_stdout_has_no_bom(self, stub_json, capsys):
+        stub_json([review_page([review(1)], cursor="C1")])
+        steam_cli.cmd_reviews(make_args(["reviews", "1", "-n", "1", "--delay", "0", "--csv"]))
+        out = capsys.readouterr().out
+        assert not out.startswith("﻿")                      # no BOM on stdout
+        assert out.startswith("recommendationid,")
+
+    def test_csv_flattens_review_to_one_line(self, stub_json, capsys):
+        rev = review(1)
+        rev["review"] = "line one\nline two\twith tab"
+        stub_json([review_page([rev], cursor="C1")])
+        steam_cli.cmd_reviews(make_args(["reviews", "1", "-n", "1", "--delay", "0", "--csv"]))
+        data_line = capsys.readouterr().out.strip().splitlines()[1]
+        assert "line one line two with tab" in data_line
+
+    def test_csv_neutralizes_formula_injection(self, stub_json, capsys):
+        rev = review(1)
+        rev["review"] = '=HYPERLINK("http://evil")'
+        stub_json([review_page([rev], cursor="C1")])
+        steam_cli.cmd_reviews(make_args(["reviews", "1", "-n", "1", "--delay", "0", "--csv"]))
+        out = capsys.readouterr().out
+        # the cell is prefixed with ' so a spreadsheet treats it as text, not a formula
+        assert "'=HYPERLINK" in out
+        assert ",=HYPERLINK" not in out
+
+    def test_conflicting_output_formats_error(self):
+        # the guard fires before any HTTP request — no stub needed
+        with pytest.raises(steam_cli.SteamError, match="pick one output format"):
+            steam_cli.cmd_reviews(make_args(["reviews", "1", "-n", "1", "--csv", "--json"]))
+
+    def test_csv_with_summary_errors(self):
+        with pytest.raises(steam_cli.SteamError, match="drop --summary"):
+            steam_cli.cmd_reviews(make_args(["reviews", "1", "--summary", "--csv"]))

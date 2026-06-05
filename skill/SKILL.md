@@ -1,6 +1,6 @@
 ---
 name: steam
-description: Query the public Steam API via the `steam-cli` command — game reviews, store details, prices, live player counts, news/patch notes, and global achievement stats. No Steam API key needed. Use whenever a task needs real data about a Steam game. English triggers — "get Steam reviews for", "what do players think of <game>", "Steam rating / score of", "is <game> any good on Steam", "Steam store info / genres / release date / developer of", "how many players is <game> has right now", "current players online", "latest patch notes / news for <game>", "Steam price of", "achievement completion rates", "download reviews for <game>", "find the appid of", "full profile / overview of <game>", "tell me everything about <game>", "what does <game> look like", "show me screenshots / the banner / art of <game>". Russian triggers — «отзывы в стиме на», «достань стим-отзывы по», «что игроки пишут про», «рейтинг игры в стиме», «какая оценка у игры в стиме», «стоит ли брать <игру> в стиме», «инфа об игре в стиме», «жанр / дата релиза / разработчик игры», «сколько сейчас онлайн в», «текущий онлайн игроков», «последние новости / патчноут по игре», «цена игры в стиме», «проценты выполнения ачивок», «выкачай отзывы по», «найди appid игры», «полный профиль игры», «расскажи всё об игре в стиме», «как выглядит игра», «покажи скриншоты / баннер / арт игры». Also use proactively when analyzing a game's reception, doing competitor/market research on Steam, or when any step needs a game's appid, sentiment, or store metadata. Do NOT use for: non-Steam stores (Epic, GOG, mobile), a specific user's profile / owned-games library / personal achievements (those need a Steam Web API key and are out of scope), or buying/wishlisting games.
+description: Query the public Steam API via the `steam-cli` command — game reviews, store details, prices, live player counts, news/patch notes, and global achievement stats. No Steam API key needed. Use whenever a task needs real data about a Steam game. English triggers — "get Steam reviews for", "what do players think of <game>", "Steam rating / score of", "is <game> any good on Steam", "Steam store info / genres / release date / developer of", "how many players is <game> has right now", "current players online", "latest patch notes / news for <game>", "Steam price of", "achievement completion rates", "download reviews for <game>", "find the appid of", "full profile / overview of <game>", "tell me everything about <game>", "what does <game> look like", "show me screenshots / the banner / art of <game>", "games on sale / Steam specials / discounts right now", "top sellers on Steam", "look up a Steam player / profile", "who wrote this review / the reviewer's profile". Russian triggers — «отзывы в стиме на», «достань стим-отзывы по», «что игроки пишут про», «рейтинг игры в стиме», «какая оценка у игры в стиме», «стоит ли брать <игру> в стиме», «инфа об игре в стиме», «жанр / дата релиза / разработчик игры», «сколько сейчас онлайн в», «текущий онлайн игроков», «последние новости / патчноут по игре», «цена игры в стиме», «проценты выполнения ачивок», «выкачай отзывы по», «найди appid игры», «полный профиль игры», «расскажи всё об игре в стиме», «как выглядит игра», «покажи скриншоты / баннер / арт игры», «что на распродаже в стиме», «скидки / специальные предложения стим», «топ продаж сейчас», «профиль игрока в стиме», «кто оставил этот отзыв», «что за человек написал отзыв». Also use proactively when analyzing a game's reception, doing competitor/market research on Steam, or when any step needs a game's appid, sentiment, or store metadata. **Public Steam Community profiles ARE supported** (key-free, via `profile`). Do NOT use for: non-Steam stores (Epic, GOG, mobile); a user's owned-games library, private-profile details, or per-user achievements (those need a Steam Web API key and stay out of scope); or buying/wishlisting games.
 ---
 
 # steam — query the public Steam API
@@ -67,6 +67,9 @@ freshness). Manage it with `steam-cli cache` (show size/path), `cache --path`,
 | `steam-cli news <game>` | News / patch notes |
 | `steam-cli achievements <game>` | Global achievement completion % |
 | `steam-cli price <game> [--cc us,de,ru]` | Price + discount for one or more regions |
+| `steam-cli specials` | Games currently **on sale** (featured front-page specials) |
+| `steam-cli top-sellers` | Current **top-selling** games |
+| `steam-cli profile <id>` | **Public** Steam Community profile (steamID64 / vanity); pairs with a reviewer's `author.steamid` |
 | `steam-cli cache [--path\|--clear]` | Inspect or clear the on-disk cache |
 
 ## JSON output shapes
@@ -87,6 +90,8 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 | `achievements` | **bare array** `[{name, percent}]`, sorted by `percent` desc (names are internal API ids) |
 | `price` | `{appid, regions:[{cc, name, is_free, price_overview} \| {cc, error}]}` |
 | `images` | `{appid, out, images:[{kind, url, path} \| {kind, url, error}]}` |
+| `specials` / `top-sellers` | `{section, cc, count, items:[{id, name, discounted, discount_percent, original_price, final_price, currency, header_image}]}` — **prices are integer minor units** (cents): `final_price: 899` = $8.99 |
+| `profile` | `{steamid64, name, private, privacy_state, online_state, state_message, member_since, location, real_name, summary, vac_banned, avatar, profile_url}` — non-`public` profiles set `private:true` and null the hidden fields |
 
 ## `images` — see the game, don't just read about it
 
@@ -137,8 +142,13 @@ steam-cli reviews "Hades" --summary --json
 # A sample of reviews to actually read (cursor-paginated).
 steam-cli reviews 1145360 -n 200 --language english --json -q
 
-# Every review to a file (large games = many pages; be patient).
-steam-cli reviews 1145360 --all --output reviews.json
+# Every review to a JSON file (large games = many pages; be patient).
+steam-cli reviews 1145360 --all --json --output reviews.json
+
+# Every review to a CSV for Excel / Numbers / Sheets (UTF-8 BOM, flat columns).
+steam-cli reviews 1145360 --all --csv --output reviews.csv
+# (author_steamid is a 17-digit id — Excel truncates big numbers on auto-open;
+#  import it as text, or use --json if you need the exact id.)
 
 # Only negative reviews, to find complaints.
 steam-cli reviews 1145360 --review-type negative -n 100 --json -q
@@ -148,7 +158,8 @@ Key flags: `-n N` (cap, default 100) · `--all` (everything) · `--summary`
 (score + totals, one request) · `--language CODE|all` · `--review-type
 all|positive|negative` · `--filter recent|updated|all` · `--min-playtime
 HOURS` (only reviewers with ≥ N hours) · `--since YYYY-MM-DD` (only reviews
-from that date on) · `--jsonl` (one object per line) · `--output FILE`.
+from that date on) · `--jsonl` (one object per line) · `--csv` (flat CSV for
+spreadsheets) · `--output FILE`. Pick one of `--json` / `--jsonl` / `--csv`.
 
 `--min-playtime` and `--since` filter the fetched window client-side — combine
 with `-n` to e.g. "100 recent reviews, but only from players with 20+ hours".
@@ -174,6 +185,11 @@ A review object includes `voted_up`, `review` (text), `timestamp_created`,
 - **"What does <game> look like?" / judging art style** → `images <game> --json
   -q`, then open the returned `path`s with your own image-reading capability
   and describe what you see.
+- **"Who wrote this review? / understand the reviewer"** → each review object
+  carries `author.steamid`; feed it to `profile <steamid> --json` to see the
+  player (member-since, playtime context, bio, VAC) — public profiles only.
+- **"What's on sale / what's hot right now?"** → `specials --json` for discounts,
+  `top-sellers --json` for what's selling.
 - **"What changed recently?"** → `news <game> -c 5`.
 
 ## What not to do
