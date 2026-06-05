@@ -1295,7 +1295,7 @@ class TestCache:
     def _net_counter(self, monkeypatch, payload=b"DATA"):
         calls = {"n": 0}
 
-        def net(url, timeout, insecure):
+        def net(url, timeout, insecure, cookie=None):
             calls["n"] += 1
             return payload
 
@@ -1840,3 +1840,414 @@ class TestReviewsCsv:
     def test_csv_with_summary_errors(self):
         with pytest.raises(steam_cli.SteamError, match="drop --summary"):
             steam_cli.cmd_reviews(make_args(["reviews", "1", "--summary", "--csv"]))
+
+
+# --------------------------------------------------------------------------- #
+# market recon: tags / browse / similar / history / estimate                   #
+# --------------------------------------------------------------------------- #
+
+class TestExtractJsArray:
+    def test_balanced_matching_ignores_bracket_in_string(self):
+        # a `]` inside a tag name must not end the array prematurely
+        text = 'InitAppTagModal( 1, [{"name":"a]b","tagid":7}], 1 )'
+        arr = steam_cli._extract_js_array(text, "InitAppTagModal(")
+        assert json.loads(arr) == [{"name": "a]b", "tagid": 7}]
+
+    def test_marker_absent_returns_none(self):
+        assert steam_cli._extract_js_array("nothing here", "InitAppTagModal(") is None
+
+    def test_escaped_quote_in_string(self):
+        text = r'M( [{"name":"a\"]b","id":1}] )'
+        assert json.loads(steam_cli._extract_js_array(text, "M(")) == \
+            [{"name": 'a"]b', "id": 1}]
+
+
+class TestTags:
+    def _stub(self, monkeypatch, fixture_bytes):
+        monkeypatch.setattr(steam_cli, "http_get",
+                            lambda *a, **k: fixture_bytes("apptags_1145360.html"))
+
+    def test_json_from_real_page(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_tags(make_args(["tags", "1145360", "--json", "-q"]))
+        o = json.loads(capsys.readouterr().out)
+        assert o["appid"] == 1145360 and o["count"] == 20
+        assert o["tags"][0]["name"] == "Action Roguelike"
+        assert o["tags"][0]["count"] == 1427
+        counts = [t["count"] for t in o["tags"]]
+        assert counts == sorted(counts, reverse=True)   # vote-ranked
+
+    def test_limit(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_tags(make_args(["tags", "1145360", "--limit", "3", "--json", "-q"]))
+        assert json.loads(capsys.readouterr().out)["count"] == 3
+
+    def test_text_render(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_tags(make_args(["tags", "1145360", "-q"]))
+        out = capsys.readouterr().out
+        assert "Action Roguelike" in out and "1,427" in out
+
+    def test_format_change_raises_parse_not_empty(self, monkeypatch):
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: b"<html>no modal</html>")
+        with pytest.raises(steam_cli.SteamError, match="could not find user tags") as ei:
+            steam_cli.cmd_tags(make_args(["tags", "1145360", "--json", "-q"]))
+        assert ei.value.code == "parse"
+
+    def test_sends_age_gate_cookie(self, monkeypatch):
+        seen = {}
+
+        def grab(url, timeout=30.0, insecure=False, cache_ttl=0, cookie=None):
+            seen["cookie"] = cookie
+            return b'<script>InitAppTagModal( 1, [{"tagid":1,"name":"X","count":5}], 1 );</script>'
+
+        monkeypatch.setattr(steam_cli, "http_get", grab)
+        steam_cli.cmd_tags(make_args(["tags", "1", "--json", "-q"]))
+        assert seen["cookie"] and "mature_content=1" in seen["cookie"]
+
+
+class TestBrowse:
+    def _stub(self, fixture):
+        def respond(url, params=None):
+            if "populartags" in url:
+                return fixture("populartags.json")
+            if "search/results" in url:
+                return fixture("search_results_cozy.json")
+            raise AssertionError(f"unexpected url {url}")
+        return respond
+
+    def test_json_niche_size_is_real_total_not_page_len(self, stub_json, fixture, capsys):
+        stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(["browse", "--tags", "cozy", "--count", "5", "--json"]))
+        o = json.loads(capsys.readouterr().out)
+        assert o["tag_ids"] == [97376]
+        assert o["niche_size"] == 1056      # full match count, not len(items)
+        assert o["count"] == 5
+        assert o["items"][0]["name"] == "A Short Hike"
+        assert all("appid" in it and "name" in it and "tagids" in it
+                   for it in o["items"])
+
+    def test_resolves_tag_names_to_ids(self, stub_json, fixture):
+        stub = stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(
+            ["browse", "--tags", "cozy,roguelike", "--count", "5", "--json"]))
+        search = [c for c in stub.calls if "search/results" in c.url][0]
+        assert search.params["tags"] == "97376,1716"
+
+    def test_numeric_tag_passes_through_without_dict(self, stub_json, fixture):
+        # a raw numeric tag id must not require the dictionary lookup
+        def respond(url, params=None):
+            assert "populartags" not in url, "should not fetch the tag dict"
+            return fixture("search_results_cozy.json")
+        stub_json(respond)
+        steam_cli.cmd_browse(make_args(["browse", "--tags", "1716", "--count", "5", "--json"]))
+
+    def test_max_price_free_maps_to_free(self, stub_json, fixture):
+        stub = stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(
+            ["browse", "--tags", "cozy", "--max-price", "0", "--count", "5", "--json"]))
+        search = [c for c in stub.calls if "search/results" in c.url][0]
+        assert search.params["maxprice"] == "free"
+
+    def test_max_price_dollars_passed(self, stub_json, fixture):
+        stub = stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(
+            ["browse", "--tags", "cozy", "--max-price", "15", "--count", "5", "--json"]))
+        search = [c for c in stub.calls if "search/results" in c.url][0]
+        assert search.params["maxprice"] == 15
+
+    def test_sort_maps_to_steam_token(self, stub_json, fixture):
+        stub = stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(
+            ["browse", "--tags", "cozy", "--sort", "released", "--count", "5", "--json"]))
+        search = [c for c in stub.calls if "search/results" in c.url][0]
+        assert search.params["sort_by"] == "Released_DESC"
+
+    def test_unknown_tag_errors_with_hint(self, stub_json, fixture):
+        stub_json(self._stub(fixture))
+        with pytest.raises(steam_cli.SteamError, match="unknown Steam tag") as ei:
+            steam_cli.cmd_browse(make_args(["browse", "--tags", "notarealtag", "--json"]))
+        assert ei.value.code == "invalid"
+
+    def test_results_but_no_rows_raises_parse(self, stub_json):
+        stub_json({"success": 1, "total_count": 50, "results_html": "<div>changed</div>"})
+        with pytest.raises(steam_cli.SteamError, match="page format changed") as ei:
+            steam_cli.cmd_browse(make_args(["browse", "--count", "5", "--json"]))
+        assert ei.value.code == "parse"
+
+    def test_empty_niche_is_not_an_error(self, stub_json):
+        stub_json({"success": 1, "total_count": 0, "results_html": ""})
+        items, total = steam_cli._search_results([999999], count=5)
+        assert items == [] and total == 0
+
+    def test_titleless_row_falls_back_to_own_slug_not_neighbor(self):
+        # robustness: if the title span ever moves, the name falls back to THIS
+        # row's URL slug — never borrows the next game's name.
+        html = ('<a href="https://store.steampowered.com/app/111/Game_A/?snr=1" '
+                'data-ds-appid="111" data-ds-tagids="[1,2]">capsule only</a>'
+                '<a href="https://store.steampowered.com/app/222/Game_B/?snr=1" '
+                'data-ds-appid="222" data-ds-tagids="[3,4]">'
+                '<span class="title">Real Game</span></a>')
+        rows = steam_cli._parse_search_rows(html)
+        assert rows == [
+            {"appid": 111, "name": "Game A", "tagids": [1, 2]},      # slug fallback
+            {"appid": 222, "name": "Real Game", "tagids": [3, 4]},   # title span wins
+        ]
+
+    def test_class_rename_still_parses_via_stable_anchors(self):
+        # presentational classes gone entirely → still works off /app/<id>/<slug>/
+        html = ('<a href="https://store.steampowered.com/app/777/Cool_Game/">'
+                '<span class="renamed">Cool Game</span></a>')
+        rows = steam_cli._parse_search_rows(html)
+        assert rows == [{"appid": 777, "name": "Cool Game", "tagids": []}]
+
+    def test_text_render_shows_niche_size(self, stub_json, fixture, capsys):
+        stub_json(self._stub(fixture))
+        steam_cli.cmd_browse(make_args(["browse", "--tags", "cozy", "--count", "5"]))
+        out = capsys.readouterr().out
+        assert "Niche size: 1,056" in out and "A Short Hike" in out
+
+
+class TestSimilar:
+    def _stub(self, monkeypatch, fixture_bytes):
+        monkeypatch.setattr(steam_cli, "http_get",
+                            lambda *a, **k: fixture_bytes("morelike_1145360.html"))
+
+    def test_json_from_real_page(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_similar(make_args(["similar", "1145360", "--json", "-q"]))
+        o = json.loads(capsys.readouterr().out)
+        assert o["appid"] == 1145360
+        first = o["similar"][0]
+        assert first["appid"] == 1145350
+        assert first["name"] == "Hades II"     # derived from the URL slug
+        assert isinstance(first["tagids"], list)
+
+    def test_limit(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_similar(make_args(["similar", "1145360", "--limit", "2", "--json", "-q"]))
+        assert json.loads(capsys.readouterr().out)["count"] == 2
+
+    def test_source_app_excluded_and_deduped(self, monkeypatch):
+        html = (
+            '<a class="similar_grid_capsule" data-ds-appid="1145360" '
+            'href="https://store.steampowered.com/app/1145360/Hades/"></a>'
+            '<a class="similar_grid_capsule" data-ds-appid="999" '
+            'href="https://store.steampowered.com/app/999/Other_Game/"></a>'
+            '<a class="similar_grid_capsule" data-ds-appid="999" '
+            'href="https://store.steampowered.com/app/999/Other_Game/"></a>')
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: html.encode())
+        out = steam_cli._similar_apps(1145360)
+        assert [it["appid"] for it in out] == [999]        # source dropped, dup dropped
+        assert out[0]["name"] == "Other Game"
+
+    def test_parses_without_capsule_class_via_data_attr(self, monkeypatch):
+        # the "similar_grid_capsule" class gone → still parses off data-ds-appid
+        html = ('<a class="renamed" data-ds-appid="42" data-ds-tagids="[9]" '
+                'href="https://store.steampowered.com/app/42/Neat_Game/?snr=1"></a>')
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: html.encode())
+        out = steam_cli._similar_apps(1145360)
+        assert out == [{"appid": 42, "name": "Neat Game", "tagids": [9]}]
+
+    def test_format_change_raises_parse(self, monkeypatch):
+        monkeypatch.setattr(steam_cli, "http_get", lambda *a, **k: b"<html>nothing</html>")
+        with pytest.raises(steam_cli.SteamError, match="no similar games") as ei:
+            steam_cli.cmd_similar(make_args(["similar", "1145360", "--json", "-q"]))
+        assert ei.value.code == "parse"
+
+    def test_text_labels_recommendation_nature(self, monkeypatch, fixture_bytes, capsys):
+        self._stub(monkeypatch, fixture_bytes)
+        steam_cli.cmd_similar(make_args(["similar", "1145360", "-q"]))
+        out = capsys.readouterr().out
+        assert "not a curated competitor list" in out and "Hades II" in out
+
+
+class TestHistory:
+    def test_json_summary_from_real_histogram(self, stub_json, fixture, capsys):
+        stub_json(fixture("appreviewhistogram_1145360.json"))
+        steam_cli.cmd_history(make_args(["history", "1145360", "--json", "-q"]))
+        o = json.loads(capsys.readouterr().out)
+        assert o["appid"] == 1145360
+        s = o["summary"]
+        assert s["buckets"] == 79
+        assert s["launch"]["pct_positive"] == 99
+        assert s["recent_30d"]["total"] == 1400
+        assert s["peak"]["total"] == 34321
+        assert len(o["rollups"]) == 79 and len(o["recent_30d"]) == 30
+
+    def test_no_data_raises_not_found(self, stub_json):
+        stub_json({"success": 0})
+        with pytest.raises(steam_cli.SteamError, match="no review histogram") as ei:
+            steam_cli.cmd_history(make_args(["history", "1145360", "--json", "-q"]))
+        assert ei.value.code == "not_found"
+
+    def test_text_shows_launch_vs_recent(self, stub_json, fixture, capsys):
+        stub_json(fixture("appreviewhistogram_1145360.json"))
+        steam_cli.cmd_history(make_args(["history", "1145360", "--months", "3", "-q"]))
+        out = capsys.readouterr().out
+        assert "review velocity" in out
+        assert "Launch" in out and "Recent" in out and "Last 30 days" in out
+
+    def test_months_zero_tabulates_all(self, stub_json, fixture, capsys):
+        stub_json(fixture("appreviewhistogram_1145360.json"))
+        steam_cli.cmd_history(make_args(["history", "1145360", "--months", "0", "-q"]))
+        assert "Last 79" in capsys.readouterr().out
+
+    def test_empty_rollups_no_crash(self, stub_json, capsys):
+        stub_json({"success": 1, "results": {"rollups": [], "recent": [],
+                                             "rollup_type": "week"}})
+        steam_cli.cmd_history(make_args(["history", "1", "--json", "-q"]))
+        o = json.loads(capsys.readouterr().out)
+        assert o["summary"]["buckets"] == 0
+        assert o["summary"]["peak"] is None
+        assert o["summary"]["launch"]["pct_positive"] is None
+
+
+class TestEstimate:
+    def _resp(self, total=152006, price=2499, free=False):
+        def respond(url, params):
+            if "appdetails" in url:
+                d = {"name": "Hades", "type": "game", "is_free": free}
+                if not free:
+                    d["price_overview"] = {"final_formatted": "$24.99",
+                                           "initial": price, "final": price}
+                return appdetails(1145360, d)
+            if "GetNumberOfCurrentPlayers" in url:
+                return {"response": {"result": 1, "player_count": 1}}
+            if "appreviews" in url:
+                return {"success": 1, "query_summary": {
+                    "total_reviews": total, "total_positive": total,
+                    "review_score_desc": "x"}}
+            raise AssertionError(f"unexpected url {url}")
+        return respond
+
+    def test_three_tier_range_and_revenue(self, stub_json, capsys):
+        stub_json(self._resp())
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--json", "-q"]))
+        est = json.loads(capsys.readouterr().out)["sales_estimate"]
+        assert est["owners"]["conservative"]["owners"] == 152006 * 20
+        assert est["owners"]["mid"]["owners"] == 152006 * 40
+        assert est["owners"]["optimistic"]["owners"] == 152006 * 80
+        assert est["revenue_usd"]["mid"] == round(152006 * 40 * 24.99)
+        assert est["price_usd"] == 24.99
+
+    def test_custom_multiplier_collapses_to_one_tier(self, stub_json, capsys):
+        stub_json(self._resp())
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--multiplier", "30", "--json", "-q"]))
+        est = json.loads(capsys.readouterr().out)["sales_estimate"]
+        assert list(est["owners"]) == ["custom"]
+        assert est["owners"]["custom"]["owners"] == 152006 * 30
+        # a whole-number multiplier renders as int 30, not float 30.0
+        assert est["owners"]["custom"]["multiplier"] == 30
+        assert isinstance(est["owners"]["custom"]["multiplier"], int)
+
+    def test_free_game_has_owners_but_no_revenue(self, stub_json, capsys):
+        stub_json(self._resp(free=True))
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--json", "-q"]))
+        est = json.loads(capsys.readouterr().out)["sales_estimate"]
+        assert est["revenue_usd"] is None
+        assert est["owners"]["mid"]["owners"] == 152006 * 40
+
+    def test_absent_without_flag(self, stub_json, capsys):
+        stub_json(self._resp())
+        steam_cli.cmd_overview(make_args(["overview", "1145360", "--json", "-q"]))
+        assert "sales_estimate" not in json.loads(capsys.readouterr().out)
+
+    def test_zero_reviews_yields_null_estimate(self, stub_json, capsys):
+        stub_json(self._resp(total=0))
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--json", "-q"]))
+        assert json.loads(capsys.readouterr().out)["sales_estimate"] is None
+
+    def test_text_render_carries_disclaimer(self, stub_json, capsys):
+        stub_json(self._resp())
+        steam_cli.cmd_overview(make_args(["overview", "1145360", "--estimate", "-q"]))
+        out = capsys.readouterr().out
+        assert "Boxleiter" in out and "order-of-magnitude" in out
+
+
+# --------------------------------------------------------------------------- #
+# HTTP layer: optional cookie threading (for age-gated store pages)            #
+# --------------------------------------------------------------------------- #
+
+class TestCookieThreading:
+    class _FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"BODY"
+
+    def test_urllib_sends_cookie_header(self, monkeypatch):
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["cookie"] = req.get_header("Cookie")
+            return self._FakeResp()
+
+        monkeypatch.setattr(steam_cli.urllib.request, "urlopen", fake_urlopen)
+        steam_cli._get_urllib("http://x", 9.0, cookie="birthtime=0; mature_content=1")
+        assert "mature_content=1" in seen["cookie"]
+
+    def test_urllib_no_cookie_omits_header(self, monkeypatch):
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["cookie"] = req.get_header("Cookie")
+            return self._FakeResp()
+
+        monkeypatch.setattr(steam_cli.urllib.request, "urlopen", fake_urlopen)
+        steam_cli._get_urllib("http://x", 9.0)
+        assert seen["cookie"] is None
+
+    def test_curl_adds_b_flag(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
+
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        steam_cli._get_curl("http://x", 10.0, False, cookie="a=b")
+        assert "-b" in seen["cmd"]
+        assert seen["cmd"][seen["cmd"].index("-b") + 1] == "a=b"
+
+    def test_http_get_threads_cookie_to_network(self, monkeypatch):
+        seen = {}
+
+        def net(url, timeout, insecure, cookie=None):
+            seen["cookie"] = cookie
+            return b"X"
+
+        monkeypatch.setattr(steam_cli, "_http_get_network", net)
+        steam_cli.http_get("http://x", cookie="k=v")
+        assert seen["cookie"] == "k=v"
+
+    def test_default_path_still_calls_two_arg_urllib(self, monkeypatch):
+        # the no-cookie path must keep calling _get_urllib(url, timeout) so the
+        # existing 2-arg stubs throughout the suite keep working
+        monkeypatch.setattr(steam_cli, "_get_urllib", lambda url, timeout: b"OK")
+        assert steam_cli.http_get("http://x") == b"OK"
+
+
+# --------------------------------------------------------------------------- #
+# parser: new recon subcommands are wired                                      #
+# --------------------------------------------------------------------------- #
+
+class TestReconParser:
+    def test_new_commands_registered(self):
+        for name, fn in (("tags", steam_cli.cmd_tags),
+                         ("similar", steam_cli.cmd_similar),
+                         ("history", steam_cli.cmd_history)):
+            assert make_args([name, "570"]).func is fn
+        assert make_args(["browse", "--tags", "cozy"]).func is steam_cli.cmd_browse
+
+    def test_browse_defaults(self):
+        a = make_args(["browse"])
+        assert a.sort == "reviews" and a.count == 20 and a.max_price is None
+
+    def test_invalid_sort_rejected(self):
+        with pytest.raises(SystemExit):
+            make_args(["browse", "--sort", "bogus"])

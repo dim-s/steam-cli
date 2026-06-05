@@ -1,6 +1,6 @@
 ---
 name: steam
-description: Query the public Steam API via the `steam-cli` command — game reviews, store details, prices, live player counts, news/patch notes, and global achievement stats. No Steam API key needed. Use whenever a task needs real data about a Steam game. English triggers — "get Steam reviews for", "what do players think of <game>", "Steam rating / score of", "is <game> any good on Steam", "Steam store info / genres / release date / developer of", "how many players is <game> has right now", "current players online", "latest patch notes / news for <game>", "Steam price of", "achievement completion rates", "download reviews for <game>", "find the appid of", "full profile / overview of <game>", "tell me everything about <game>", "what does <game> look like", "show me screenshots / the banner / art of <game>", "games on sale / Steam specials / discounts right now", "top sellers on Steam", "look up a Steam player / profile", "who wrote this review / the reviewer's profile". Russian triggers — «отзывы в стиме на», «достань стим-отзывы по», «что игроки пишут про», «рейтинг игры в стиме», «какая оценка у игры в стиме», «стоит ли брать <игру> в стиме», «инфа об игре в стиме», «жанр / дата релиза / разработчик игры», «сколько сейчас онлайн в», «текущий онлайн игроков», «последние новости / патчноут по игре», «цена игры в стиме», «проценты выполнения ачивок», «выкачай отзывы по», «найди appid игры», «полный профиль игры», «расскажи всё об игре в стиме», «как выглядит игра», «покажи скриншоты / баннер / арт игры», «что на распродаже в стиме», «скидки / специальные предложения стим», «топ продаж сейчас», «профиль игрока в стиме», «кто оставил этот отзыв», «что за человек написал отзыв». Also use proactively when analyzing a game's reception, doing competitor/market research on Steam, or when any step needs a game's appid, sentiment, or store metadata. **Public Steam Community profiles ARE supported** (key-free, via `profile`). Do NOT use for: non-Steam stores (Epic, GOG, mobile); a user's owned-games library, private-profile details, or per-user achievements (those need a Steam Web API key and stay out of scope); or buying/wishlisting games.
+description: Query the public Steam API (no key) via the `steam-cli` command — reviews & sentiment, store info (genres/release/devs/price/metacritic), live player counts, news/patch notes, achievement stats, screenshots/art, sales & top-sellers, public player profiles, plus market recon: user tags, niche browse by tag/price, similar games, review-velocity history, rough sales estimates. Use whenever a task needs real Steam data on a game, its reception, or its niche/competitors. English triggers — "Steam reviews/rating/score of", "is <game> good on Steam", "Steam store info/genres/release/price of", "players online now", "patch notes/news for", "achievement %", "find the appid", "overview of <game>", "screenshots/art of", "what's on sale / top sellers", "Steam profile of / who wrote this review", "user tags of <game>", "find cozy/roguelike games / how big is the niche", "browse Steam by tag", "games similar to <game>", "how many copies did <game> sell / owners / revenue", "did its launch hold up / review history". Russian triggers — «отзывы/рейтинг/оценка в стиме», «инфа/жанр/дата/цена игры», «онлайн игроков сейчас», «патчноут/новости», «проценты ачивок», «найди appid», «обзор игры», «скриншоты/арт», «распродажа/топ продаж», «профиль игрока/кто написал отзыв», «теги игры», «найди cozy/роглайк, размер ниши», «полистай стим по тегу», «похожие игры на», «сколько копий продала/владельцев/выручка», «удержался ли лонч/история отзывов». Also use proactively for analyzing a game's reception or competitor/niche research on Steam. Public Steam Community profiles ARE supported (key-free). Do NOT use for non-Steam stores (Epic/GOG/mobile), a user's owned-games library / private profiles / per-user achievements (need a Web API key), or buying/wishlisting.
 ---
 
 # steam — query the public Steam API
@@ -69,6 +69,11 @@ freshness). Manage it with `steam-cli cache` (show size/path), `cache --path`,
 | `steam-cli price <game> [--cc us,de,ru]` | Price + discount for one or more regions |
 | `steam-cli specials` | Games currently **on sale** (featured front-page specials) |
 | `steam-cli top-sellers` | Current **top-selling** games |
+| `steam-cli tags <game>` | **User (community) tags** with vote counts — Cozy, Roguelike, Wholesome… (what `info` genres/categories miss) |
+| `steam-cli browse --tags …` | **Faceted niche search** — size *and* list a niche by tag / price / sort (the only key-free "map the niche" query) |
+| `steam-cli similar <game>` | Steam **"more like this"** recommendations (buyers-also-viewed) |
+| `steam-cli history <game>` | **Review-volume velocity over time** — launch spike vs now, peak month |
+| `steam-cli overview <game> --estimate` | Add a rough **Boxleiter sales estimate** (owners/revenue range) to the overview |
 | `steam-cli profile <id>` | **Public** Steam Community profile (steamID64 / vanity); pairs with a reviewer's `author.steamid` |
 | `steam-cli cache [--path\|--clear]` | Inspect or clear the on-disk cache |
 
@@ -81,7 +86,7 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 
 | Command | Shape |
 |---|---|
-| `overview` | `{appid, name, type, release_date, coming_soon, developers, publishers, genres, metacritic, is_free, price_cc, price, players_online, review_summary, store_url, news?, top_achievements?}` (`price_cc` = the region the `price` is for) |
+| `overview` | `{appid, name, type, release_date, coming_soon, developers, publishers, genres, metacritic, is_free, price_cc, price, players_online, review_summary, store_url, news?, top_achievements?, sales_estimate?}` (`price_cc` = the region the `price` is for; `sales_estimate` only with `--estimate`) |
 | `reviews` | `{appid, query_summary:{review_score_desc, total_reviews, total_positive, total_negative}, count, reviews:[…]}` · `--summary` → `{appid, query_summary}` · `--jsonl` → one review object per line |
 | `info` | raw Steam appdetails object: `{steam_appid, name, type, is_free, genres:[{id, description}], release_date:{date, coming_soon}, developers, price_overview?, …}` (large) |
 | `search` | **bare array** `[{id, name, type, price?}]` — no `appid` wrapper |
@@ -91,6 +96,11 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 | `price` | `{appid, regions:[{cc, name, is_free, price_overview} \| {cc, error}]}` |
 | `images` | `{appid, out, images:[{kind, url, path} \| {kind, url, error}]}` |
 | `specials` / `top-sellers` | `{section, cc, count, items:[{id, name, discounted, discount_percent, original_price, final_price, currency, header_image}]}` — **prices are integer minor units** (cents): `final_price: 899` = $8.99 |
+| `tags` | `{appid, count, tags:[{tagid, name, count, browseable}]}` — `count` is the user vote weight; sorted high→low |
+| `browse` | `{tags, tag_ids, sort, max_price, cc, niche_size, count, items:[{appid, name, tagids}]}` — **`niche_size` is the full match count** (the niche size), `count`/`items` are the page you asked for |
+| `similar` | `{appid, count, similar:[{appid, name, tagids}]}` — `name` is derived from the store URL slug (may be null); recommendations, **not** a curated competitor set |
+| `history` | `{appid, summary:{buckets, rollup_type, window, overall, launch, tail, recent_30d, peak}, rollups:[{date, recommendations_up, recommendations_down}], recent_30d:[…]}` — each agg is `{up, down, total, pct_positive}`; `date` is epoch seconds |
+| `overview --estimate` | adds `sales_estimate:{method, data, total_reviews, owners:{conservative,mid,optimistic:{multiplier,owners}}, revenue_usd, price_usd}` — `revenue_usd` null for free/unknown-price; **rough order-of-magnitude, not a Steam figure** |
 | `profile` | `{steamid64, name, private, privacy_state, online_state, state_message, member_since, location, real_name, summary, vac_banned, avatar, profile_url}` — non-`public` profiles set `private:true` and null the hidden fields |
 
 ## `images` — see the game, don't just read about it
@@ -132,6 +142,67 @@ Opt-in fields, added only when their flag is set: `--news N` → `news` (latest
 N items, `null` on failure) and `--top-achievements N` → `top_achievements`
 (top N by completion %, `null` on failure). With both, `overview` is a
 one-call "full profile" — no need to also hit `news` / `achievements`.
+
+## Market recon — `tags` / `browse` / `similar` / `history` / `--estimate`
+
+For competitor and niche research, these reach Steam's *own* storefront
+surfaces that the JSON web API doesn't expose (user tags, the faceted search
+feed, the recommendation grid, the review histogram). First-party Steam only —
+no third-party aggregators.
+
+```bash
+# What discovery tags is a game actually surfaced under (with vote weight)?
+# info gives valve genres/categories; THIS gives Cozy/Wholesome/Roguelike etc.
+steam-cli tags "Hades" --json -q
+
+# Map a niche: how big is it, and what's in it?  niche_size = full match count.
+steam-cli browse --tags cozy,roguelike --max-price 15 --sort reviews --count 30 --json
+#   --tags  comma-separated names (resolved via Steam's tag dict) or raw ids
+#   --max-price USD (0 = free only)  --sort reviews|released|price-asc|price-desc|name
+
+# Algorithmic "more like this" set for a game (buyers-also-viewed).
+steam-cli similar "Hades" --json -q
+
+# Did a game's launch spike die or hold?  Review velocity over time.
+steam-cli history "Hades" --months 12 --json -q
+
+# Rough sales/owners scale from the review count (Boxleiter), folded into overview.
+steam-cli overview "Hades" --estimate --json -q
+```
+
+**`tags`** — the discovery tags a game ranks under, with vote counts. This is
+what `info` (valve genres + categories) misses and what the cozy/casual niche
+actually runs on. Use the tag **names/ids** here to feed `browse`.
+
+**`browse`** — the only key-free way to *size and list* a niche. `niche_size`
+is the full count of games matching your filters (e.g. "1,056 cozy games ≤
+$15"); `items` is just the page you paged in (`--count`). Use it to build a
+"map of the niche" and compare competitor density. Tag names are resolved via
+Steam's public tag dictionary; an unknown tag is a hard `invalid` error with a
+hint — run `tags <game>` to discover real names.
+
+**`similar`** — Steam's "more like this" recommendations. These are
+*buyers-also-viewed*, **not** a curated competitor list — useful for an outreach
+set or to find adjacent games, but treat the list as recommendations, not "my
+exact competitors." `name` comes from the URL slug and may be null.
+
+**`history`** — review-volume velocity. `summary` compares the **launch**
+window (first 3 buckets) to the **recent** window (last 3) and the last 30 days,
+plus the **peak** bucket — so you can answer "did the launch spike hold or
+die?". It's review *volume* over time, the closest key-free proxy for momentum
+(true wishlist/follower and concurrent-player history live only in SteamDB /
+the partner backend and are **not** reachable here).
+
+**`overview --estimate`** — a Boxleiter owners/revenue estimate (owners ≈
+reviews × multiplier) as a **range** (conservative 20× / mid 40× / optimistic
+80×), or a single `--multiplier N`. This is an external heuristic on top of a
+real Steam figure (the review count), **not** a Steam-reported sales number —
+the error bars are large; use it for order-of-magnitude, never precision.
+
+> **Not reachable key-free (don't fabricate it):** wishlists & followers, and
+> historical concurrent-player / price curves. These live only in SteamDB or
+> the Steamworks partner backend. `history` (review velocity) is the nearest
+> public proxy for pre-launch/retention momentum.
 
 ## `reviews` — the main tool
 
@@ -178,9 +249,17 @@ A review object includes `voted_up`, `review` (text), `timestamp_created`,
 - **"Is <game> well received?"** → `reviews <game> --summary --json` for the
   headline numbers; if asked *why*, follow with `reviews <game> -n 100
   --review-type negative --json -q` and summarize the complaints.
-- **Market/competitor research** → `search` to enumerate appids, then
-  `overview` per candidate; compare scores, player counts and price in one
-  pass.
+- **Market/competitor research** → `browse --tags <niche> --max-price <cap>` to
+  size and list the niche (`niche_size` = how crowded it is), then `overview`
+  per candidate; compare scores, player counts and price in one pass. Add
+  `similar <game>` for the algorithmic neighbour set.
+- **"What niche/tags is <game> in? / position it"** → `tags <game>` for the
+  discovery tags it ranks under (with vote weight) — what genres/categories miss.
+- **"Did <game>'s launch hold or fade?"** → `history <game>` — compare the launch
+  window to recent in `summary` (review velocity is the public momentum proxy;
+  wishlist/follower history is SteamDB-only, not available here).
+- **"Roughly how many copies did <game> sell?"** → `overview <game> --estimate`
+  for a Boxleiter owners/revenue *range* — order-of-magnitude only, not exact.
 - **"Is it cheaper elsewhere?"** → `price <game> --cc us,de,ru,br --json`.
 - **"What does <game> look like?" / judging art style** → `images <game> --json
   -q`, then open the returned `path`s with your own image-reading capability

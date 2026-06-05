@@ -5,7 +5,8 @@
 # ///
 """steam-cli — query the public Steam API (no API key needed).
 
-Subcommands: reviews, info, search, players, news, achievements, price.
+Subcommands: overview, reviews, info, search, players, news, achievements,
+price, images, specials, top-sellers, profile, tags, browse, similar, history.
 Stdlib only. Transparently falls back from urllib to `curl` when the host
 intercepts TLS (corporate proxies, dev machines with a custom root CA).
 """
@@ -30,7 +31,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
@@ -304,13 +305,17 @@ _curl_fallback = False
 _MAX_RETRIES = 3
 
 
-def _get_urllib(url: str, timeout: float) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def _get_urllib(url: str, timeout: float, cookie: str | None = None) -> bytes:
+    headers = {"User-Agent": USER_AGENT}
+    if cookie:
+        headers["Cookie"] = cookie
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
-def _get_curl(url: str, timeout: float, insecure: bool) -> bytes:
+def _get_curl(url: str, timeout: float, insecure: bool,
+              cookie: str | None = None) -> bytes:
     curl = shutil.which("curl")
     if not curl:
         raise SteamError(
@@ -321,6 +326,8 @@ def _get_curl(url: str, timeout: float, insecure: bool) -> bytes:
     cmd = [curl, "-fsSL", "--max-time", str(int(timeout)), "-A", USER_AGENT]
     if insecure:
         cmd.append("-k")
+    if cookie:
+        cmd += ["-b", cookie]
     cmd.append(url)
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
@@ -339,23 +346,35 @@ def _retriable_status(code: int) -> bool:
 
 
 def http_get(url: str, timeout: float = 30.0, insecure: bool = False,
-             *, cache_ttl: float = 0) -> bytes:
+             *, cache_ttl: float = 0, cookie: str | None = None) -> bytes:
     cached = _cache_get(url, cache_ttl)
     if cached is not None:
         return cached
-    raw = _http_get_network(url, timeout, insecure)
+    raw = _http_get_network(url, timeout, insecure, cookie=cookie)
     _cache_put(url, raw, cache_ttl)
     return raw
 
 
-def _http_get_network(url: str, timeout: float, insecure: bool) -> bytes:
+def _http_get_network(url: str, timeout: float, insecure: bool,
+                      cookie: str | None = None) -> bytes:
     global _curl_fallback
+    # Pass `cookie` only when set, so the default path keeps calling
+    # _get_urllib/_get_curl with their original argument lists (tests stub
+    # those with 2-/3-arg lambdas).
+    def urllib_get():
+        return _get_urllib(url, timeout, cookie=cookie) if cookie \
+            else _get_urllib(url, timeout)
+
+    def curl_get(insec):
+        return _get_curl(url, timeout, insec, cookie=cookie) if cookie \
+            else _get_curl(url, timeout, insec)
+
     if _HTTP_MODE == "curl" or _curl_fallback or insecure:
-        return _get_curl(url, timeout, insecure)
+        return curl_get(insecure)
     last: Exception | None = None
     for attempt in range(_MAX_RETRIES):
         try:
-            return _get_urllib(url, timeout)
+            return urllib_get()
         except urllib.error.HTTPError as e:
             if _retriable_status(e.code) and attempt < _MAX_RETRIES - 1:
                 last = e
@@ -365,7 +384,7 @@ def _http_get_network(url: str, timeout: float, insecure: bool) -> bytes:
         except urllib.error.URLError as e:
             if _HTTP_MODE == "auto" and _is_tls_error(e) and shutil.which("curl"):
                 _curl_fallback = True  # remember for the rest of the run
-                return _get_curl(url, timeout, insecure=False)
+                return curl_get(False)
             if _is_tls_error(e):
                 # TLS interception with no curl to fall back to — retrying
                 # the same handshake won't help.
@@ -1026,6 +1045,14 @@ def cmd_overview(args) -> int:
         overview["top_achievements"] = soft(lambda: _achievement_percentages(
             appid, insecure=args.insecure, timeout=args.timeout
         )[: args.top_achievements])
+    if args.estimate:
+        rs = overview.get("review_summary") or {}
+        p = overview.get("price") or {}
+        # full (pre-discount) price is the right baseline for a revenue proxy
+        price_cents = None if is_free else (p.get("initial") or p.get("final"))
+        overview["sales_estimate"] = _boxleiter_estimate(
+            rs.get("total_reviews"), price_cents=price_cents,
+            multiplier=args.multiplier)
     if args.json:
         _emit_json(overview)
         return 0
@@ -1076,7 +1103,27 @@ def _print_overview(o: dict) -> None:
             print(f"  {a.get('percent', 0):6.2f}%  {a.get('name', '?')}")
         if not o["top_achievements"]:
             print("  n/a")
+    if "sales_estimate" in o:
+        _print_estimate(o["sales_estimate"])
     print(f"\nStore: {o['store_url']}")
+
+
+def _print_estimate(est: dict | None) -> None:
+    print("\nSales estimate (Boxleiter — rough, external heuristic):")
+    if not est:
+        print("  n/a (no review count to extrapolate from)")
+        return
+    rev = est.get("revenue_usd")
+    for label, info in est["owners"].items():
+        line = f"  {label:13} ×{str(info['multiplier']):<4} ≈ {_grouped(info['owners'])} owners"
+        if rev is not None:
+            line += f"  ·  ≈ ${_grouped(rev[label])} gross"
+        print(line)
+    if rev is None:
+        print("  (revenue n/a — game is free or price unknown)")
+    print(f"  from {_grouped(est['total_reviews'])} reviews"
+          + (f" × ${est['price_usd']:.2f}" if est.get("price_usd") else "")
+          + "; owners/revenue are order-of-magnitude, not exact.")
 
 
 # ----- subcommand: images --------------------------------------------------
@@ -1340,6 +1387,446 @@ def _print_profile(p: dict) -> None:
         print(f"\n{p['profile_url']}")
 
 
+# ----- subcommands: market recon (tags / browse / similar / history) -------
+# These read Steam's own storefront surfaces *beyond* the JSON web API: user
+# tags (the app page's InitAppTagModal blob), the faceted /search/results feed
+# (the only key-free way to size a niche by tag/price/date), the "more like
+# this" recommendation grid, and the review-volume histogram. All first-party
+# Steam — no third-party aggregators. Markup-derived data is fragile by nature:
+# when a parser finds nothing where Steam says there are results, it raises a
+# parse error rather than returning a silently-empty list.
+
+_AGE_GATE_COOKIE = "birthtime=0; mature_content=1"  # bypass the store age check
+
+
+def _extract_js_array(text: str, marker: str) -> str | None:
+    """Return the first JS array literal following `marker`, matched with
+    balanced brackets that respect (double-quoted) string literals — so a `]`
+    inside a tag name can't prematurely end the array. Assumes Steam's
+    JSON-style double quotes; None if not found. A genuinely malformed slice
+    surfaces later as a json.loads parse error, which is the intended failure."""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    j = text.find("[", i)
+    if j < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for k in range(j, len(text)):
+        c = text[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return text[j:k + 1]
+    return None
+
+
+def _app_tags(appid: int, *, insecure: bool = False,
+              timeout: float = 30.0) -> list[dict]:
+    """User tags with vote counts, parsed from the app page's InitAppTagModal."""
+    raw = http_get(f"{STORE}/app/{appid}/?cc=us&l=english", timeout=timeout,
+                   insecure=insecure, cache_ttl=DEFAULT_TTL,
+                   cookie=_AGE_GATE_COOKIE)
+    html_text = raw.decode("utf-8", "replace")
+    blob = _extract_js_array(html_text, "InitAppTagModal(")
+    if blob is None:
+        raise SteamError(
+            f"could not find user tags for appid {appid} (Steam page format "
+            "changed, or the app has no store page).", code="parse")
+    try:
+        tags = json.loads(blob)
+    except json.JSONDecodeError as e:
+        raise SteamError(f"could not parse user tags for appid {appid}: {e}",
+                         code="parse")
+    out = [{
+        "tagid": t.get("tagid"), "name": t.get("name"),
+        "count": t.get("count"), "browseable": bool(t.get("browseable")),
+    } for t in tags if isinstance(t, dict) and t.get("tagid") is not None]
+    # Steam already serves these vote-ranked, but sort defensively so the
+    # contract ("rarest concern last, top tag first") holds even if it stops.
+    out.sort(key=lambda t: t["count"] or 0, reverse=True)
+    return out
+
+
+def cmd_tags(args) -> int:
+    appid = resolve_appid(args.game, insecure=args.insecure,
+                          quiet=args.json or args.quiet, timeout=args.timeout)
+    tags = _app_tags(appid, insecure=args.insecure, timeout=args.timeout)
+    if args.limit and args.limit > 0:
+        tags = tags[: args.limit]
+    if args.json:
+        _emit_json({"appid": appid, "count": len(tags), "tags": tags})
+        return 0
+    _print_tags(appid, tags)
+    return 0
+
+
+def _print_tags(appid: int, tags: list[dict]) -> None:
+    print(f"appid {appid}: {len(tags)} user tags (by votes)\n")
+    for t in tags:
+        cnt = _grouped(t["count"]) if t.get("count") is not None else "—"
+        print(f"  {cnt:>8}  {t.get('name', '?')}  (id {t.get('tagid')})")
+
+
+# --- browse: faceted store search (the niche map) ---
+
+_SORT_MAP = {
+    "reviews": "Reviews_DESC",      # most-reviewed (proxy for most-owned)
+    "released": "Released_DESC",    # newest first
+    "price-asc": "Price_ASC",
+    "price-desc": "Price_DESC",
+    "name": "Name_ASC",
+}
+
+# Robust parsing: anchor on the /app/<id>/<slug>/ store URL — Steam's most
+# stable contract (unchanged for years) — and on the data-ds-* attributes its
+# dynamic-store JS depends on, NOT on presentational CSS classes like
+# "search_result_row"/"title"/"similar_grid_capsule". A restyle then degrades
+# gracefully (the name falls back to the URL slug) instead of breaking, and a
+# row is bounded by the next anchor so one game's id can't borrow another's name.
+_APP_HREF_RE = re.compile(
+    r'href="https?://store\.steampowered\.com/app/(\d+)/([^/"?]*)', re.I)
+_SEARCH_ANCHOR_RE = re.compile(r'<a\b[^>]*?' + _APP_HREF_RE.pattern + r'[^>]*>', re.I)
+_TITLE_SPAN_RE = re.compile(r'<span class="title">([^<]+)</span>')
+_TAGIDS_RE = re.compile(r'data-ds-tagids="(\[[^\]]*\])"')
+
+
+def _slug_to_name(slug: str) -> str | None:
+    """Turn a store-URL slug (A_Short_Hike) into a readable name (A Short Hike)."""
+    return urllib.parse.unquote(slug).replace("_", " ").strip() or None
+
+
+def _tagids_in(tag: str) -> list:
+    m = _TAGIDS_RE.search(tag)
+    if not m:
+        return []
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return []
+
+
+def _parse_search_rows(html_text: str) -> list[dict]:
+    anchors = list(_SEARCH_ANCHOR_RE.finditer(html_text))
+    rows = []
+    for i, m in enumerate(anchors):
+        end = anchors[i + 1].start() if i + 1 < len(anchors) else len(html_text)
+        # prefer the visible title; fall back to the URL slug if the span moved
+        title_m = _TITLE_SPAN_RE.search(html_text, m.end(), end)
+        name = html.unescape(title_m.group(1).strip()) if title_m \
+            else _slug_to_name(m.group(2))
+        rows.append({"appid": int(m.group(1)), "name": name,
+                     "tagids": _tagids_in(m.group(0))})
+    return rows
+
+
+def _tag_dictionary(*, insecure: bool = False, timeout: float = 30.0) -> dict:
+    """name(lowercased) -> tagid, from Steam's public tag dictionary."""
+    data = http_json(f"{STORE}/tagdata/populartags/english", {},
+                     timeout=timeout, insecure=insecure)
+    return {str(t.get("name", "")).strip().lower(): t.get("tagid")
+            for t in (data or []) if t.get("name")}
+
+
+def _resolve_tag_ids(names: list[str], *, insecure: bool = False,
+                     timeout: float = 30.0) -> list[int]:
+    """Map tag names (or raw numeric ids) to Steam tag ids; reject the unknown."""
+    dictionary = None
+    ids: list[int] = []
+    unknown: list[str] = []
+    for name in names:
+        n = name.strip()
+        if not n:
+            continue
+        if n.isdigit():
+            ids.append(int(n))
+            continue
+        if dictionary is None:
+            dictionary = _tag_dictionary(insecure=insecure, timeout=timeout)
+        tid = dictionary.get(n.lower())
+        if tid is None:
+            unknown.append(name)
+        else:
+            ids.append(int(tid))
+    if unknown:
+        hint = _suggest(unknown[0].strip().lower(), dictionary or {})
+        raise SteamError(
+            f"unknown Steam tag(s): {', '.join(unknown)}"
+            + (f'; did you mean "{hint}"?' if hint else
+               "; use `steam-cli tags <game>` to discover real tag names"),
+            code="invalid")
+    return ids
+
+
+def _search_results(tag_ids: list[int], *, sort: str = "reviews",
+                    max_price=None, count: int = 20, cc: str = "us",
+                    lang: str = "english", insecure: bool = False,
+                    timeout: float = 30.0) -> tuple[list[dict], int]:
+    """Faceted storefront search → (items, total_count). total_count is the
+    full niche size matching the filters, independent of how many we page in."""
+    per_page = min(100, max(1, count))
+    items: list[dict] = []
+    seen: set[int] = set()
+    total = 0
+    start = 0
+    while len(items) < count:
+        params = {
+            "query": "", "start": start, "count": per_page, "dynamic_data": "",
+            "sort_by": _SORT_MAP.get(sort, "Reviews_DESC"),
+            "infinite": 1, "json": 1, "cc": cc, "l": lang,
+        }
+        if tag_ids:
+            params["tags"] = ",".join(str(t) for t in tag_ids)
+        if max_price is not None:
+            params["maxprice"] = "free" if max_price == 0 else max_price
+        data = http_json(f"{STORE}/search/results/", params,
+                         timeout=timeout, insecure=insecure)
+        if data.get("success") != 1:
+            raise SteamError(f"Steam search failed (success={data.get('success')}).",
+                             code="not_found")
+        total = data.get("total_count", total)
+        rows = _parse_search_rows(data.get("results_html", "") or "")
+        if not rows:
+            # Page 1 empty while Steam claims matches → the markup shifted under
+            # us; fail loudly, don't return a false "empty". On a *later* page an
+            # empty result just means the niche ran out (total_count is
+            # approximate and often exceeds what Steam actually paginates) — the
+            # markup is identical across pages, so this is never a parse failure.
+            if start == 0 and total:
+                raise SteamError("Steam search returned results but none could "
+                                 "be parsed (page format changed).", code="parse")
+            break
+        added = False
+        for r in rows:
+            if r["appid"] in seen:
+                continue
+            seen.add(r["appid"])
+            items.append(r)
+            added = True
+            if len(items) >= count:
+                break
+        if not added:                    # a page of all-dupes → no more new rows
+            break
+        start += per_page
+    return items[:count], total
+
+
+def cmd_browse(args) -> int:
+    args.cc = normalize_country(args.cc)
+    names = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    tag_ids = _resolve_tag_ids(names, insecure=args.insecure,
+                               timeout=args.timeout) if names else []
+    items, total = _search_results(
+        tag_ids, sort=args.sort, max_price=args.max_price, count=args.count,
+        cc=args.cc, insecure=args.insecure, timeout=args.timeout)
+    if args.json:
+        _emit_json({"tags": names, "tag_ids": tag_ids, "sort": args.sort,
+                    "max_price": args.max_price, "cc": args.cc,
+                    "niche_size": total, "count": len(items), "items": items})
+        return 0
+    _print_browse(items, total, names, args)
+    return 0
+
+
+def _print_browse(items: list[dict], total: int, names: list[str], args) -> None:
+    filt = []
+    if names:
+        filt.append("tags=" + ",".join(names))
+    if args.max_price is not None:
+        filt.append("free only" if args.max_price == 0 else f"≤ ${args.max_price}")
+    filt.append(f"sort={args.sort}")
+    print(f"Niche size: {_grouped(total)} games matching "
+          f"[{' · '.join(filt)}]  [cc={args.cc}]")
+    print(f"Showing top {len(items)}:\n")
+    for it in items:
+        print(f"{it['appid']:>8}  {it['name']}")
+    if total > len(items):
+        print(f"\n… {_grouped(total - len(items))} more (raise --count).")
+
+
+# --- similar: the "more like this" recommendation grid ---
+# Recommendation capsules are <a> tags carrying data-ds-appid (the stable
+# dynamic-store attribute); we key on that rather than the
+# "similar_grid_capsule" CSS class, so a restyle doesn't break the parse. The
+# source app rides the page as a <div> (no <a>), so it's skipped naturally and
+# by the explicit id check.
+_REC_ANCHOR_RE = re.compile(r'<a\b[^>]*?\bdata-ds-appid="\d+"[^>]*?>', re.I)
+
+
+def _similar_apps(appid: int, *, insecure: bool = False,
+                  timeout: float = 30.0) -> list[dict]:
+    raw = http_get(f"{STORE}/recommended/morelike/app/{appid}", timeout=timeout,
+                   insecure=insecure, cache_ttl=DEFAULT_TTL,
+                   cookie=_AGE_GATE_COOKIE)
+    html_text = raw.decode("utf-8", "replace")
+    out: list[dict] = []
+    seen: set[int] = set()
+    for tag in _REC_ANCHOR_RE.findall(html_text):
+        rid = int(re.search(r'data-ds-appid="(\d+)"', tag).group(1))
+        if rid == appid or rid in seen:    # drop the source app and dupes
+            continue
+        seen.add(rid)
+        # the capsule href carries the title slug: /app/<id>/Hades_II/?...
+        m_slug = _APP_HREF_RE.search(tag)
+        name = _slug_to_name(m_slug.group(2)) if m_slug else None
+        out.append({"appid": rid, "name": name, "tagids": _tagids_in(tag)})
+    if not out:
+        raise SteamError(
+            f"no similar games parsed for appid {appid} (Steam page format "
+            "changed, or none are recommended).", code="parse")
+    return out
+
+
+def cmd_similar(args) -> int:
+    appid = resolve_appid(args.game, insecure=args.insecure,
+                          quiet=args.json or args.quiet, timeout=args.timeout)
+    items = _similar_apps(appid, insecure=args.insecure, timeout=args.timeout)
+    if args.limit and args.limit > 0:
+        items = items[: args.limit]
+    if args.json:
+        _emit_json({"appid": appid, "count": len(items), "similar": items})
+        return 0
+    _print_similar(appid, items)
+    return 0
+
+
+def _print_similar(appid: int, items: list[dict]) -> None:
+    print(f"appid {appid}: {len(items)} algorithmically similar games")
+    print("(Steam 'more like this' — buyers-also-viewed recommendations, "
+          "not a curated competitor list)\n")
+    for it in items:
+        print(f"{it['appid']:>8}  {it.get('name') or '—'}")
+
+
+# --- history: review-volume velocity over time ---
+
+def _review_histogram(appid: int, *, insecure: bool = False,
+                      timeout: float = 30.0) -> dict:
+    data = http_json(f"{STORE}/appreviewhistogram/{appid}", {"l": "english"},
+                     timeout=timeout, insecure=insecure)
+    if data.get("success") != 1:
+        raise SteamError(f"no review histogram for appid {appid} "
+                         f"(success={data.get('success')}).", code="not_found")
+    return data.get("results", {}) or {}
+
+
+def _agg_rollups(items: list[dict]) -> dict:
+    up = sum(int(r.get("recommendations_up", 0) or 0) for r in items)
+    down = sum(int(r.get("recommendations_down", 0) or 0) for r in items)
+    tot = up + down
+    return {"up": up, "down": down, "total": tot,
+            "pct_positive": round(100 * up / tot) if tot else None}
+
+
+def _histogram_summary(rollups: list[dict], recent: list[dict],
+                       rollup_type: str | None) -> dict:
+    n = len(rollups)
+    win = min(3, n)
+    peak = None
+    if rollups:
+        pk = max(rollups, key=lambda r: int(r.get("recommendations_up", 0) or 0)
+                 + int(r.get("recommendations_down", 0) or 0))
+        peak = {"date": pk.get("date"),
+                "up": pk.get("recommendations_up"),
+                "down": pk.get("recommendations_down"),
+                "total": int(pk.get("recommendations_up", 0) or 0)
+                + int(pk.get("recommendations_down", 0) or 0)}
+    return {
+        "buckets": n, "rollup_type": rollup_type, "window": win,
+        "overall": _agg_rollups(rollups),
+        "launch": _agg_rollups(rollups[:win]),
+        "tail": _agg_rollups(rollups[-win:]),
+        "recent_30d": _agg_rollups(recent),
+        "peak": peak,
+    }
+
+
+def cmd_history(args) -> int:
+    appid = resolve_appid(args.game, insecure=args.insecure,
+                          quiet=args.json or args.quiet, timeout=args.timeout)
+    results = _review_histogram(appid, insecure=args.insecure, timeout=args.timeout)
+    rollups = results.get("rollups", []) or []
+    recent = results.get("recent", []) or []
+    summary = _histogram_summary(rollups, recent, results.get("rollup_type"))
+    if args.json:
+        _emit_json({"appid": appid, "summary": summary,
+                    "rollups": rollups, "recent_30d": recent})
+        return 0
+    _print_history(appid, summary, rollups, args)
+    return 0
+
+
+def _print_history(appid: int, s: dict, rollups: list[dict], args) -> None:
+    rt = s.get("rollup_type") or "period"
+    print(f"appid {appid}: review velocity — {s['buckets']} {rt} buckets\n")
+
+    def line(label, a):
+        pct = f"{a['pct_positive']}% pos" if a["pct_positive"] is not None else "n/a"
+        print(f"  {label:14} {_grouped(a['total']):>9} reviews  "
+              f"({_grouped(a['up'])}▲/{_grouped(a['down'])}▼, {pct})")
+
+    line(f"Launch (first {s['window']})", s["launch"])
+    line(f"Recent (last {s['window']})", s["tail"])
+    line("Last 30 days", s["recent_30d"])
+    line("All time", s["overall"])
+    pk = s.get("peak")
+    if pk:
+        print(f"  {'Peak ' + rt:14} {_grouped(pk['total']):>9} reviews  "
+              f"({_ts(pk['date'])})")
+    tail = rollups[-args.months:] if args.months > 0 else rollups
+    if tail:
+        print(f"\nLast {len(tail)} {rt}s:")
+        for r in tail:
+            up = int(r.get("recommendations_up", 0) or 0)
+            dn = int(r.get("recommendations_down", 0) or 0)
+            print(f"  {_ts(r.get('date'))}  {_grouped(up):>7}▲ {_grouped(dn):>6}▼")
+
+
+# --- sales estimate: the Boxleiter method (folded into `overview`) ---
+# Owners ≈ review_count × multiplier. The multiplier varies wildly by genre,
+# price and era (published estimates span ~20–80×), so we report a range, not a
+# single false-precision number. This is an external heuristic on top of a real
+# Steam figure (the review count), not a Steam-reported sales number.
+
+_BOXLEITER_TIERS = (("conservative", 20), ("mid", 40), ("optimistic", 80))
+
+
+def _boxleiter_estimate(total_reviews, *, price_cents=None,
+                        multiplier=None) -> dict | None:
+    if not total_reviews:
+        return None
+    if multiplier is not None:
+        # argparse hands floats; show a whole number as an int (30, not 30.0)
+        m = int(multiplier) if float(multiplier).is_integer() else multiplier
+        tiers = (("custom", m),)
+    else:
+        tiers = _BOXLEITER_TIERS
+    owners = {label: {"multiplier": m, "owners": int(total_reviews * m)}
+              for label, m in tiers}
+    out = {"method": "boxleiter (external heuristic)",
+           "data": "Steam review count", "total_reviews": total_reviews,
+           "owners": owners, "revenue_usd": None}
+    if price_cents and price_cents > 0:
+        price = price_cents / 100
+        out["price_usd"] = price
+        out["revenue_usd"] = {label: round(total_reviews * m * price)
+                              for label, m in tiers}
+    return out
+
+
 # ----- argument parser -----------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1468,6 +1955,12 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("--top-achievements", type=int, default=0, metavar="N",
                     help="also include the top N achievements by completion %% "
                          "(0 = off)")
+    ov.add_argument("--estimate", action="store_true",
+                    help="add a rough Boxleiter sales estimate (owners/revenue "
+                         "range from the review count — external heuristic)")
+    ov.add_argument("--multiplier", type=float, default=None, metavar="N",
+                    help="override the Boxleiter range with a single "
+                         "owners-per-review multiplier")
     add_common(ov)
     ov.set_defaults(func=cmd_overview)
 
@@ -1506,6 +1999,51 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("user", help="steamID64 (17 digits), vanity name, or profile URL")
     add_common(pf)
     pf.set_defaults(func=cmd_profile)
+
+    # tags
+    tg = sub.add_parser("tags",
+                        help="user (community) tags with vote counts")
+    tg.add_argument("game", help="appid or game name")
+    tg.add_argument("--limit", type=int, default=0,
+                    help="cap to the top N tags by votes (0 = all)")
+    add_common(tg)
+    tg.set_defaults(func=cmd_tags)
+
+    # browse
+    br = sub.add_parser("browse",
+                        help="faceted store search: size and list a niche by "
+                             "tag / price / sort")
+    br.add_argument("--tags", default="", metavar="T1,T2",
+                    help="comma-separated tag names or ids (e.g. cozy,roguelike); "
+                         "names resolved via Steam's tag dictionary")
+    br.add_argument("--max-price", type=int, default=None, metavar="USD",
+                    help="cap price in the cc's currency units (0 = free only)")
+    br.add_argument("--sort", choices=list(_SORT_MAP), default="reviews",
+                    help="ordering (default reviews = most-reviewed)")
+    br.add_argument("--count", type=int, default=20, metavar="N",
+                    help="how many results to list (default 20; niche_size is "
+                         "always the full match count)")
+    br.add_argument("--cc", default="us", help="country code (region for prices)")
+    add_common(br)
+    br.set_defaults(func=cmd_browse)
+
+    # similar
+    sm = sub.add_parser("similar",
+                        help="Steam 'more like this' recommendations for a game")
+    sm.add_argument("game", help="appid or game name")
+    sm.add_argument("--limit", type=int, default=0,
+                    help="cap to N recommendations (0 = all returned)")
+    add_common(sm)
+    sm.set_defaults(func=cmd_similar)
+
+    # history
+    hi = sub.add_parser("history",
+                        help="review-volume velocity over time (launch vs now)")
+    hi.add_argument("game", help="appid or game name")
+    hi.add_argument("--months", type=int, default=12, metavar="N",
+                    help="how many recent buckets to tabulate (0 = all)")
+    add_common(hi)
+    hi.set_defaults(func=cmd_history)
 
     # cache
     ca = sub.add_parser("cache", help="show or clear the on-disk cache")

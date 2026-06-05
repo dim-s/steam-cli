@@ -90,6 +90,13 @@ steam-cli price 1145360 --cc us,de,ru,br
 steam-cli specials
 steam-cli top-sellers
 
+# market recon: user tags, niche sizing, similar set, review velocity, sales scale
+steam-cli tags "Hades"                                   # discovery tags + vote weight
+steam-cli browse --tags cozy,roguelike --max-price 15    # size & list a niche
+steam-cli similar "Hades"                                # "more like this" set
+steam-cli history "Hades"                                # launch spike vs now
+steam-cli overview "Hades" --estimate                    # rough Boxleiter owners/revenue
+
 # public profile of a Steam user (e.g. a reviewer's author.steamid)
 steam-cli profile 76561197960287930
 ```
@@ -109,6 +116,10 @@ steam-cli profile 76561197960287930
 | `price <game>` | Price + discount for one or more regions | `store/api/appdetails` |
 | `specials` | Games currently on sale (featured specials) | `store/api/featuredcategories` |
 | `top-sellers` | Current top-selling games | `store/api/featuredcategories` |
+| `tags <game>` | User (community) tags with vote counts | `store/app` page (`InitAppTagModal`) |
+| `browse --tags …` | Faceted niche search: size + list by tag/price/sort | `store/search/results` + `store/tagdata` |
+| `similar <game>` | "More like this" recommendation set | `store/recommended/morelike` |
+| `history <game>` | Review-volume velocity over time | `store/appreviewhistogram` |
 | `profile <id>` | Public Steam Community profile (no key) | `steamcommunity.com/…?xml=1` |
 | `cache [--path/--clear]` | Inspect or clear the on-disk cache | — (local) |
 
@@ -213,6 +224,16 @@ keeps working on such machines. Force a backend with
   human-readable names/descriptions require a Web API key (`GetSchemaForGame`).
 - **Aggregate totals** (`reviews --summary`) reflect the active `--language`
   filter; use `--language all` (the default) for global numbers.
+- **Recon commands read storefront markup** — `tags`, `browse` and `similar`
+  parse Steam's own HTML/search feed (still first-party, no third-party
+  aggregators). If Steam reshapes a page the parser raises a `parse` error
+  rather than returning silently-empty data.
+- **`overview --estimate` is a Boxleiter heuristic** (owners ≈ reviews ×
+  multiplier), reported as a range — order-of-magnitude only, not a Steam
+  figure.
+- **Wishlists, followers, and historical player/price curves are not
+  available** key-free (they live only in SteamDB or the Steamworks partner
+  backend). `history` (review velocity) is the nearest public momentum proxy.
 
 ## Claude Code skill
 
