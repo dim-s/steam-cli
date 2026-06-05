@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steam-cli"
+version = "1.0.0"
+description = "Query the public Steam API (reviews, info, prices, players, news, achievements). Stdlib-only Python 3 CLI."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "Дмитрий Зайцев"}]
+keywords = ["steam", "steam-api", "reviews", "gamedev", "cli", "appdetails"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Games/Entertainment",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.urls]
+Homepage = "https://github.com/dim-s/steam-cli"
+Issues = "https://github.com/dim-s/steam-cli/issues"
+Repository = "https://github.com/dim-s/steam-cli"
+
+[project.scripts]
+steam-cli = "steam_cli:main"
+
+[tool.setuptools]
+py-modules = ["steam_cli"]
