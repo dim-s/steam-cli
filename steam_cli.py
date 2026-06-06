@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
@@ -2065,7 +2065,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_io() -> None:
+    """Make stdout/stderr emit UTF-8 regardless of the host console encoding.
+
+    On a legacy Windows console (cp1252/cp437) the default encoding raises
+    UnicodeEncodeError on non-ASCII game names, review text in any language, or
+    the ▲ ▼ → · glyphs this CLI prints — so the command would crash on most of
+    the Steam catalog. Reconfiguring to UTF-8 with errors="replace" means output
+    degrades to a placeholder char in the rare un-encodable case instead of
+    aborting. No-op where the stream can't be reconfigured (a pytest capture
+    buffer, a plain StringIO), so it's safe everywhere."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_io()
     args = build_parser().parse_args(argv)
     if getattr(args, "no_cache", False):
         _CACHE.enabled = False

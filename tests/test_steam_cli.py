@@ -822,6 +822,52 @@ class TestMain:
         assert rc == 0
         assert json.loads(capsys.readouterr().out)["player_count"] == 437832
 
+    def test_main_forces_utf8_io(self, monkeypatch, stub_json, fixture):
+        # main() must reconfigure the console to UTF-8 before doing anything, so
+        # a legacy Windows console doesn't crash on non-ASCII output.
+        called = []
+        monkeypatch.setattr(steam_cli, "_force_utf8_io",
+                            lambda: called.append(True))
+        stub_json(fixture("players_570.json"))
+        steam_cli.main(["players", "570", "--json"])
+        assert called == [True]
+
+
+class TestForceUtf8Io:
+    """The Windows-console UTF-8 guard: reconfigure when possible, never crash."""
+
+    def test_reconfigures_streams_to_utf8(self, monkeypatch):
+        class FakeStream:
+            def __init__(self):
+                self.kwargs = None
+
+            def reconfigure(self, **kwargs):
+                self.kwargs = kwargs
+
+        out, err = FakeStream(), FakeStream()
+        monkeypatch.setattr(steam_cli.sys, "stdout", out)
+        monkeypatch.setattr(steam_cli.sys, "stderr", err)
+        steam_cli._force_utf8_io()
+        assert out.kwargs == {"encoding": "utf-8", "errors": "replace"}
+        assert err.kwargs == {"encoding": "utf-8", "errors": "replace"}
+
+    def test_stream_without_reconfigure_is_skipped(self, monkeypatch):
+        # A plain object (no .reconfigure, like a StringIO / pytest buffer) must
+        # not raise — older Pythons or redirected streams hit this path.
+        import io
+        monkeypatch.setattr(steam_cli.sys, "stdout", io.StringIO())
+        monkeypatch.setattr(steam_cli.sys, "stderr", object())
+        steam_cli._force_utf8_io()   # no exception == pass
+
+    def test_reconfigure_failure_is_swallowed(self, monkeypatch):
+        class Hostile:
+            def reconfigure(self, **kwargs):
+                raise ValueError("can't reconfigure a detached buffer")
+
+        monkeypatch.setattr(steam_cli.sys, "stdout", Hostile())
+        monkeypatch.setattr(steam_cli.sys, "stderr", Hostile())
+        steam_cli._force_utf8_io()   # swallowed == pass
+
 
 # --------------------------------------------------------------------------- #
 # HTTP layer: retry with backoff                                               #

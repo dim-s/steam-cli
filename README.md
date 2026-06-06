@@ -1,5 +1,7 @@
 # steam-cli
 
+[🇬🇧 English](./README.md) · [🇷🇺 Русский](./README.ru.md)
+
 Query the **public Steam API** from the command line — game reviews, store
 details, prices, current player counts, news/patch notes, and global
 achievement stats. Single-file Python 3 CLI, **stdlib only**, no runtime
@@ -235,17 +237,47 @@ keeps working on such machines. Force a backend with
   available** key-free (they live only in SteamDB or the Steamworks partner
   backend). `history` (review velocity) is the nearest public momentum proxy.
 
-## Claude Code skill
+## Use it from an AI agent
 
-The [`skill/`](./skill) directory holds a ready-to-use skill (`SKILL.md` +
-`setup.md`) so a Claude Code agent can invoke `steam-cli` on demand and
-self-install it when missing. Symlink it into your skills dir:
+`steam-cli` runs fine by hand, but it's **built to be driven by an AI agent**
+(Claude Code, Codex CLI, opencode, …): you ask in plain language and the agent
+picks the commands and parses the result. The whole design serves machine
+consumption — `--json` on every subcommand, machine-readable errors as
+`{"error", "code"}` on stdout, the appid-resolution note kept on stderr, and a
+self-install path so an agent can bootstrap the tool when it's missing.
+
+**Claude Code** — the [`skill/`](./skill) directory is a ready-to-use skill
+(`SKILL.md` + `setup.md`): the agent knows when to apply it, invokes
+`steam-cli`, and self-installs it when missing. Symlink it into your skills dir,
+then restart Claude Code (or `/reload`):
 
 ```bash
 ln -s "$(pwd)/skill" ~/.claude/skills/steam
 ```
 
-Then restart Claude Code (or `/reload`) so the skill is indexed.
+**Codex CLI / opencode / other `AGENTS.md`-aware agents** — they read
+[`AGENTS.md`](./AGENTS.md) from the repo root, so an agent working inside this
+repo picks up the contract automatically. To make the agent aware of
+`steam-cli` **in your own project** (e.g. your game's repo), drop a short block
+into that project's `AGENTS.md`:
+
+```markdown
+## Steam data (steam-cli)
+
+`steam-cli` is installed and gives real Steam data with no API key.
+Use it for market research; always pass `--json` when you'll parse the output.
+
+- steam-cli overview "<game>" --json            # info + score + players + price
+- steam-cli reviews "<game>" --summary --json   # review sentiment
+- steam-cli browse --tags cozy,roguelike --max-price 15 --json   # size a niche
+- steam-cli similar "<game>" --json             # adjacent games
+- steam-cli overview "<game>" --estimate --json # rough owners/revenue
+```
+
+**Any other agent** — anything that can run a shell command and read JSON works:
+install the CLI (above) and call commands with `--json`. The contract is the
+same `{"error", "code"}`-on-failure, appid-note-on-stderr, normalized
+`--lang`/`--cc` described throughout this README.
 
 ## License
 

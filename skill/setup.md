@@ -45,7 +45,7 @@ pip install -e ~/dev/steam-cli
 ## Verify
 
 ```bash
-steam-cli --version   # → steam-cli 1.2.0
+steam-cli --version   # → steam-cli 1.3.1
 steam-cli --help
 ```
 
