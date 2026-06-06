@@ -1,8 +1,9 @@
 # AGENTS.md — steam-cli
 
 Guidance for AI coding agents (Codex CLI, opencode, Cursor, Aider, and any
-other agent that reads `AGENTS.md`). Claude Code users: a ready-made skill
-lives in [`skill/`](./skill) — see the README.
+other agent that reads `AGENTS.md`). There's also a portable **Agent Skill** in
+[`skill/`](./skill) (open `SKILL.md` format — works in Claude Code, Codex CLI,
+opencode, Cursor, …) that loads on demand; see the README to install it.
 
 `steam-cli` is a single-file Python 3 CLI that pulls **real data from Steam's
 public API with no key**: reviews, store info, prices, live players, news,

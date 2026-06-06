@@ -246,20 +246,42 @@ consumption — `--json` on every subcommand, machine-readable errors as
 `{"error", "code"}` on stdout, the appid-resolution note kept on stderr, and a
 self-install path so an agent can bootstrap the tool when it's missing.
 
-**Claude Code** — the [`skill/`](./skill) directory is a ready-to-use skill
-(`SKILL.md` + `setup.md`): the agent knows when to apply it, invokes
-`steam-cli`, and self-installs it when missing. Symlink it into your skills dir,
-then restart Claude Code (or `/reload`):
+### As a portable Agent Skill
+
+The [`skill/`](./skill) directory is a self-contained **Agent Skill** in the
+open `SKILL.md` format — adopted by Claude Code, OpenAI Codex CLI, opencode,
+Cursor and many other agents. The agent loads it on demand when a task matches
+its description, invokes `steam-cli`, and self-installs the tool when missing.
+
+Drop the folder into your agent's skills directory; a symlink keeps it in sync
+with this checkout:
+
+| Agent | Skills directory | Activation |
+|---|---|---|
+| Claude Code | `~/.claude/skills/steam` | automatic, by description |
+| OpenAI Codex CLI | `~/.agents/skills/steam` | `$steam` or implicit by description |
+| opencode | `~/.config/opencode/skills/steam` | on-demand (also reads `~/.claude/skills` & `~/.agents/skills`) |
+| Cursor & others | their skills dir | per the tool (Cursor: invoke manually) |
 
 ```bash
+# Claude Code  (then restart it / run /reload)
 ln -s "$(pwd)/skill" ~/.claude/skills/steam
+
+# Codex CLI — and opencode, which reads the same path
+ln -s "$(pwd)/skill" ~/.agents/skills/steam
 ```
 
-**Codex CLI / opencode / other `AGENTS.md`-aware agents** — they read
-[`AGENTS.md`](./AGENTS.md) from the repo root, so an agent working inside this
-repo picks up the contract automatically. To make the agent aware of
-`steam-cli` **in your own project** (e.g. your game's repo), drop a short block
-into that project's `AGENTS.md`:
+Then just ask in plain language — "how were the reviews for X", "how big is the
+cozy niche" — and the agent reaches for the skill itself.
+
+### As AGENTS.md (always-on project context)
+
+A skill loads on demand; [`AGENTS.md`](./AGENTS.md) is always-on context. Use it
+to bake `steam-cli` into a project's standing instructions, or for agents that
+read `AGENTS.md` (Codex CLI, opencode, Cursor, Aider, …) but where you'd rather
+not install a skill. This repo ships one, so an agent working inside it picks up
+the contract automatically. To wire it into **your own** project (e.g. your
+game's repo), drop a short block into that project's `AGENTS.md`:
 
 ```markdown
 ## Steam data (steam-cli)
@@ -274,10 +296,12 @@ Use it for market research; always pass `--json` when you'll parse the output.
 - steam-cli overview "<game>" --estimate --json # rough owners/revenue
 ```
 
-**Any other agent** — anything that can run a shell command and read JSON works:
-install the CLI (above) and call commands with `--json`. The contract is the
-same `{"error", "code"}`-on-failure, appid-note-on-stderr, normalized
-`--lang`/`--cc` described throughout this README.
+### Any other agent
+
+Anything that can run a shell command and read JSON works: install the CLI
+(above) and call commands with `--json`. The contract is the same
+`{"error", "code"}`-on-failure, appid-note-on-stderr, normalized `--lang`/`--cc`
+described throughout this README.
 
 ## License
 
