@@ -54,6 +54,50 @@ A fuller command reference and JSON shapes are in [`skill/SKILL.md`](./skill/SKI
 - Don't fabricate wishlists/followers or concurrent-player history — they
   aren't reachable key-free; `history` (review velocity) is the closest proxy.
 
+## Task board (boardown) — keep it current proactively
+
+This repo carries a markdown task board in `.boardown/`, driven by the
+`boardown` CLI. The board is the agent's persistent work queue — **the agent
+keeps it, the owner does not.** Mechanics and error handling live in the
+`boardown` skill; the project conventions on top of it:
+
+- **Drive it only through the CLI with `--json`** (it assigns ids, validates the
+  schema, refuses to clobber a changed file). Never hand-edit files in
+  `.boardown/`.
+- **Keep it current proactively — including in ordinary chat, not just on an
+  autopilot run.** When the owner hands you work and you take it on, record it
+  on the board without being asked, moving it through the same status cycle.
+  **The bar is *work*, not *talk*:** log a substantive unit (feature / bug fix /
+  refactor / notable change); skip questions, reading, design discussion with no
+  implementation, and trivial one-liners — otherwise the board becomes a diary.
+  Logging is housekeeping, so don't ask permission; just say it in one phrase
+  ("logged `SC-NN`"). A short edit that grew into real work — file it after the
+  fact straight as `done`.
+- **Status discipline:** taking a task → set `in-progress` atomically (not "about
+  to"); shipped and green → `done`; spot an adjacent bug/debt mid-task → file a
+  `todo` immediately (don't fix it silently, don't derail the current task).
+- **Closing note before `done`.** Add a short `note` (1–3 sentences): the key
+  decision or trade-off, what's left or needs runtime checking, a non-obvious
+  nuance. Not a diff recap (git has that), not a `description` echo (that's the
+  "why") — it's "what we learned in doing it".
+- **`description` carries the "why", not just the "what"** — the board is often
+  the only persistent home of a task between sessions.
+- **One standing release + backlog (standing-release).** Hold exactly one
+  `current` release — `Active` — as the whole working board. Steam/PyPI versions
+  live in **git tags + `__version__`/`pyproject.toml`**, not in releases. The CLI
+  never deletes releases: retire spent ones to `finished` (read-only archive).
+  At a rare real release, sweep (see the `boardown` skill, standing-release §).
+- **Idea ≠ task.** Feedback and "might-not-do" notions are **candidates** in the
+  `ideas` epic (a freezer the agent never pulls work from — the live queue is the
+  `current` release only). Promote a candidate with `task edit` (move into the
+  release, set the type) once it's decided. Never drop an idea into the
+  release/backlog as a plain `todo` — the agent would pick it up unprompted.
+- **Task content is written in Russian** (the owner's working language); code
+  identifiers, endpoints and flags stay verbatim. Task types: `bug`, `tech`,
+  `feature`, `docs` (`docs` only for shipped docs like the README / `SKILL.md`).
+- **Don't duplicate sources of truth.** The README and `skill/SKILL.md` stay the
+  reference; a board task **links** to them rather than copying them.
+
 ## Working ON this repo (contributors)
 
 - **Single file, stdlib only.** All code lives in `steam_cli.py` — no runtime
