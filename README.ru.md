@@ -104,7 +104,7 @@ pip install git+https://github.com/dim-s/steam-cli.git
 ### Шаг 3. Проверьте установку
 
 ```bash
-steam-cli --version       # → steam-cli 1.3.1
+steam-cli --version       # → steam-cli 1.3.2
 steam-cli overview "Hades"
 ```
 

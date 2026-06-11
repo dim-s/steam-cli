@@ -6,6 +6,7 @@ use small synthetic pages so the exact control flow can be pinned down.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -114,6 +115,11 @@ class TestFormatHelpers:
 
     def test_flatten_keeps_short_text(self):
         assert steam_cli._flatten("short", limit=280) == "short"
+
+    def test_flatten_limit_zero_returns_full(self):
+        # `--maxlength 0` is documented as "full" — limit 0 must NOT clip the
+        # last char + append an ellipsis (the old text[:-1] + "…" bug).
+        assert steam_cli._flatten("hello world", 0) == "hello world"
 
     def test_flatten_none(self):
         assert steam_cli._flatten(None) == ""
@@ -355,12 +361,28 @@ class TestGetCurl:
                             lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"BODY", stderr=b""))
         assert steam_cli._get_curl("http://x", 30.0, insecure=False) == b"BODY"
 
-    def test_nonzero_exit_raises_with_stderr(self, monkeypatch):
+    def test_exit_22_maps_to_http_error_with_status(self, monkeypatch):
+        # curl -f exits 22 on an HTTP >= 400 response; surface it as an http
+        # error (not a generic network failure) and recover the status code.
         monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
         monkeypatch.setattr(steam_cli.subprocess, "run",
-                            lambda *a, **k: SimpleNamespace(returncode=22, stdout=b"", stderr=b"404 Not Found"))
-        with pytest.raises(steam_cli.SteamError, match="404 Not Found"):
+                            lambda *a, **k: SimpleNamespace(
+                                returncode=22, stdout=b"",
+                                stderr=b"curl: (22) The requested URL returned error: 404"))
+        with pytest.raises(steam_cli.SteamError, match="HTTP 404") as ei:
             steam_cli._get_curl("http://x", 30.0, insecure=False)
+        assert ei.value.code == "http"
+        assert ei.value.status == 404
+
+    def test_genuine_network_exit_is_network_error(self, monkeypatch):
+        # a non-22 exit (e.g. 7 connection refused) stays a network error
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run",
+                            lambda *a, **k: SimpleNamespace(returncode=7, stdout=b"",
+                                                            stderr=b"Connection refused"))
+        with pytest.raises(steam_cli.SteamError, match="Connection refused") as ei:
+            steam_cli._get_curl("http://x", 30.0, insecure=False)
+        assert ei.value.code == "network"
 
     def test_insecure_adds_k_flag_and_timeout(self, monkeypatch):
         seen = {}
@@ -373,8 +395,20 @@ class TestGetCurl:
         monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
         steam_cli._get_curl("http://x", 12.7, insecure=True)
         assert "-k" in seen["cmd"]
-        assert "12" in seen["cmd"]          # --max-time int(12.7)
+        assert "13" in seen["cmd"]          # --max-time ceil(12.7), never floored
         assert seen["cmd"][-1] == "http://x"
+
+    def test_sub_second_timeout_not_floored_to_zero(self, monkeypatch):
+        # curl reads --max-time 0 as "no limit"; a sub-second timeout must clamp
+        # to at least 1s rather than silently disabling the timeout.
+        seen = {}
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run",
+                            lambda cmd, **kw: seen.update(cmd=cmd) or
+                            SimpleNamespace(returncode=0, stdout=b"ok", stderr=b""))
+        steam_cli._get_curl("http://x", 0.3, insecure=False)
+        i = seen["cmd"].index("--max-time")
+        assert seen["cmd"][i + 1] == "1"
 
 
 # --------------------------------------------------------------------------- #
@@ -396,6 +430,23 @@ class TestReviews:
         out = capsys.readouterr().out
         assert "Overwhelmingly Positive" in out
         assert "152,006 reviews" in out
+
+    def test_text_render_survives_degenerate_author(self, stub_json, capsys):
+        # author may be null, or a playtime field may be null — the text render
+        # must coalesce to 0h (like _review_to_row/_filter_reviews) instead of
+        # raising a bare AttributeError/TypeError.
+        revs = [
+            {"recommendationid": "a", "voted_up": True, "review": "r1",
+             "author": None, "timestamp_created": 0},
+            {"recommendationid": "b", "voted_up": False, "review": "r2",
+             "author": {"playtime_at_review": None}, "timestamp_created": 0},
+        ]
+        stub_json(review_page(revs, cursor="*"))
+        rc = steam_cli.cmd_reviews(make_args(["reviews", "570", "-n", "2"]))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert out.count("0h") == 2          # both degenerate authors → 0 hours
+        assert "r1" in out and "r2" in out
 
     def test_summary_failure_raises(self, stub_json):
         stub_json({"success": 2})
@@ -688,6 +739,17 @@ class TestNews:
         steam_cli.cmd_news(make_args(["news", "570"]))
         assert "No news" in capsys.readouterr().out
 
+    def test_maxlength_zero_prints_full_body(self, stub_json, capsys):
+        # --maxlength 0 promises the full body; it must not get clipped with an
+        # ellipsis by the local _flatten step.
+        body = " ".join(f"word{i}" for i in range(60))
+        stub_json({"appnews": {"newsitems": [
+            {"date": 0, "feedlabel": "Update", "title": "T", "url": "u",
+             "contents": body}]}})
+        steam_cli.cmd_news(make_args(["news", "570", "--maxlength", "0"]))
+        out = capsys.readouterr().out
+        assert body in out and "…" not in out
+
 
 # --------------------------------------------------------------------------- #
 # command: achievements                                                        #
@@ -763,6 +825,25 @@ class TestParser:
         assert "STEAM_CLI_CACHE_DIR" in help_text        # cache location env
         # the one-line description must not advertise a stale subset of commands
         assert "overview" in help_text and "images" in help_text
+
+
+def _subcommand_names() -> list[str]:
+    """Every subcommand the parser exposes, read from sub.choices."""
+    p = steam_cli.build_parser()
+    sub = next(a for a in p._actions
+               if isinstance(a, argparse._SubParsersAction))
+    return list(sub.choices)
+
+
+@pytest.mark.parametrize("name", _subcommand_names())
+def test_every_subcommand_accepts_json(name):
+    # the epilog (and AGENTS.md) promises "--json on any command" — every
+    # subparser must carry the flag, or that contract silently breaks (cache
+    # used to: `steam-cli cache --json` exited 2).
+    p = steam_cli.build_parser()
+    sub = next(a for a in p._actions if isinstance(a, argparse._SubParsersAction))
+    opts = {o for action in sub.choices[name]._actions for o in action.option_strings}
+    assert "--json" in opts, f"subcommand {name!r} is missing --json"
 
 
 class TestMain:
@@ -943,6 +1024,96 @@ class TestRetry:
         monkeypatch.setattr(steam_cli, "_get_urllib", flaky)
         assert steam_cli.http_get("http://x") == b"OK"
         assert calls["n"] == 2
+
+    # --- curl backend shares the same retry loop (regression for #5) ---
+
+    def _curl_mode(self, monkeypatch):
+        monkeypatch.setattr(steam_cli, "_HTTP_MODE", "curl")
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+
+    def test_curl_retries_on_503_then_succeeds(self, monkeypatch):
+        self._curl_mode(monkeypatch)
+        calls, sleeps = {"n": 0}, []
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return SimpleNamespace(returncode=22, stdout=b"",
+                                       stderr=b"curl: (22) The requested URL returned error: 503")
+            return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
+
+        monkeypatch.setattr(steam_cli.time, "sleep", lambda s: sleeps.append(s))
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        assert steam_cli.http_get("http://x") == b"OK"
+        assert calls["n"] == 3
+        assert sleeps == [1, 2]          # same exponential backoff as urllib
+
+    def test_curl_no_retry_on_404(self, monkeypatch):
+        self._curl_mode(monkeypatch)
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            return SimpleNamespace(returncode=22, stdout=b"",
+                                   stderr=b"curl: (22) The requested URL returned error: 404")
+
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        with pytest.raises(steam_cli.SteamError, match="HTTP 404") as ei:
+            steam_cli.http_get("http://x")
+        assert ei.value.code == "http"
+        assert calls["n"] == 1           # 4xx other than 429 is not retried
+
+    def test_curl_transient_network_error_retried(self, monkeypatch):
+        self._curl_mode(monkeypatch)
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return SimpleNamespace(returncode=7, stdout=b"", stderr=b"Connection refused")
+            return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
+
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        assert steam_cli.http_get("http://x") == b"OK"
+        assert calls["n"] == 2
+
+    def test_tls_fallback_gives_curl_fresh_retry_budget(self, monkeypatch):
+        # after the urllib→curl TLS fallback, curl must get a FULL retry budget:
+        # a curl blip post-switch still retries with first-retry backoff = 1s,
+        # not a leftover 2s slot.
+        sleeps = []
+        monkeypatch.setattr(steam_cli.time, "sleep", lambda s: sleeps.append(s))
+        monkeypatch.setattr(steam_cli, "_get_urllib",
+                            lambda url, timeout: (_ for _ in ()).throw(
+                                urllib.error.URLError(ssl.SSLError("CERTIFICATE_VERIFY_FAILED"))))
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        curl_calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            curl_calls["n"] += 1
+            if curl_calls["n"] < 2:           # first curl try fails transiently
+                return SimpleNamespace(returncode=7, stdout=b"", stderr=b"Connection refused")
+            return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
+
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        assert steam_cli.http_get("http://x") == b"OK"
+        assert curl_calls["n"] == 2
+        assert sleeps == [1]                  # fresh budget: first retry waits 2**0=1s
+
+    def test_curl_exhausts_retries_on_persistent_429(self, monkeypatch):
+        self._curl_mode(monkeypatch)
+        calls = {"n": 0}
+
+        def fake_run(cmd, **kw):
+            calls["n"] += 1
+            return SimpleNamespace(returncode=22, stdout=b"",
+                                   stderr=b"curl: (22) The requested URL returned error: 429")
+
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        with pytest.raises(steam_cli.SteamError, match="HTTP 429") as ei:
+            steam_cli.http_get("http://x")
+        assert ei.value.code == "http"
+        assert calls["n"] == steam_cli._MAX_RETRIES
 
 
 # --------------------------------------------------------------------------- #
@@ -1544,6 +1715,30 @@ class TestCacheCommand:
         assert "cleared 2" in capsys.readouterr().out
         assert (d / "important.txt").exists()
 
+    def test_path_json(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(steam_cli._CACHE, "dir", str(tmp_path / "c"))
+        steam_cli.cmd_cache(make_args(["cache", "--path", "--json"]))
+        assert json.loads(capsys.readouterr().out) == {"dir": str(tmp_path / "c")}
+
+    def test_clear_json(self, monkeypatch, tmp_path, capsys):
+        d = tmp_path / "c"
+        d.mkdir()
+        (d / "a.body").write_bytes(b"x")
+        (d / "a.meta").write_text("{}")
+        monkeypatch.setattr(steam_cli._CACHE, "dir", str(d))
+        steam_cli.cmd_cache(make_args(["cache", "--clear", "--json"]))
+        assert json.loads(capsys.readouterr().out) == {"cleared": 2, "dir": str(d)}
+
+    def test_stats_json(self, monkeypatch, tmp_path, capsys):
+        d = tmp_path / "c"
+        d.mkdir()
+        (d / "a.body").write_bytes(b"xx")     # 2 bytes
+        (d / "a.meta").write_text("{}")        # 2 bytes
+        monkeypatch.setattr(steam_cli._CACHE, "dir", str(d))
+        steam_cli.cmd_cache(make_args(["cache", "--json"]))
+        assert json.loads(capsys.readouterr().out) == {
+            "dir": str(d), "entries": 1, "files": 2, "bytes": 4}
+
 
 # --------------------------------------------------------------------------- #
 # locale normalization                                                         #
@@ -1800,6 +1995,16 @@ class TestProfile:
         assert "/id/someone" in steam_cli._profile_url(
             "https://steamcommunity.com/id/someone/")
 
+    def test_subpage_url_keeps_vanity_not_subpage(self):
+        # /id/<vanity>/badges must resolve to the vanity, not the "badges" tail
+        url = steam_cli._profile_url("https://steamcommunity.com/id/gaben/badges")
+        assert "/id/gaben/?xml=1" in url
+
+    def test_profiles_subpage_keeps_steamid(self):
+        url = steam_cli._profile_url(
+            "https://steamcommunity.com/profiles/76561190000000000/screenshots")
+        assert "/profiles/76561190000000000/?xml=1" in url
+
     def test_url_with_query_string_does_not_leak(self):
         # ?tab=games must not end up inside the vanity id
         url = steam_cli._profile_url("https://steamcommunity.com/id/gaben?tab=games")
@@ -1980,6 +2185,15 @@ class TestBrowse:
         search = [c for c in stub.calls if "search/results" in c.url][0]
         assert search.params["tags"] == "97376,1716"
 
+    def test_text_render_handles_item_without_name(self, capsys):
+        # a search row with no title/slug (name=None) must show — not literal
+        # "None" (matching _print_similar's `it.get('name') or '—'`).
+        args = make_args(["browse", "--tags", "cozy"])
+        steam_cli._print_browse([{"appid": 42, "name": None}], total=1,
+                                names=["cozy"], args=args)
+        out = capsys.readouterr().out
+        assert "—" in out and "None" not in out
+
     def test_numeric_tag_passes_through_without_dict(self, stub_json, fixture):
         # a raw numeric tag id must not require the dictionary lookup
         def respond(url, params=None):
@@ -2150,13 +2364,15 @@ class TestHistory:
 
 
 class TestEstimate:
-    def _resp(self, total=152006, price=2499, free=False):
+    def _resp(self, total=152006, price=2499, free=False, currency="USD"):
         def respond(url, params):
             if "appdetails" in url:
                 d = {"name": "Hades", "type": "game", "is_free": free}
                 if not free:
+                    # real appdetails price_overview always carries `currency`
                     d["price_overview"] = {"final_formatted": "$24.99",
-                                           "initial": price, "final": price}
+                                           "initial": price, "final": price,
+                                           "currency": currency}
                 return appdetails(1145360, d)
             if "GetNumberOfCurrentPlayers" in url:
                 return {"response": {"result": 1, "player_count": 1}}
@@ -2213,6 +2429,34 @@ class TestEstimate:
         steam_cli.cmd_overview(make_args(["overview", "1145360", "--estimate", "-q"]))
         out = capsys.readouterr().out
         assert "Boxleiter" in out and "order-of-magnitude" in out
+
+    def test_non_usd_price_omits_revenue_with_note(self, stub_json, capsys):
+        # appdetails for --cc ru returns RUB; that price must NOT be passed to a
+        # USD revenue proxy. Owners still compute; revenue stays null + a note.
+        stub_json(self._resp(currency="RUB"))
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--cc", "ru", "--json", "-q"]))
+        est = json.loads(capsys.readouterr().out)["sales_estimate"]
+        assert est["owners"]["mid"]["owners"] == 152006 * 40
+        assert est["revenue_usd"] is None
+        assert "price_usd" not in est
+        assert "RUB" in est["revenue_note"]
+
+    def test_usd_price_still_yields_revenue(self, stub_json, capsys):
+        # the cc=us path is unchanged: USD price → revenue + no note
+        stub_json(self._resp(currency="USD"))
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--json", "-q"]))
+        est = json.loads(capsys.readouterr().out)["sales_estimate"]
+        assert est["revenue_usd"]["mid"] == round(152006 * 40 * 24.99)
+        assert "revenue_note" not in est
+
+    def test_non_usd_text_render_shows_note(self, stub_json, capsys):
+        stub_json(self._resp(currency="RUB"))
+        steam_cli.cmd_overview(make_args(
+            ["overview", "1145360", "--estimate", "--cc", "ru", "-q"]))
+        out = capsys.readouterr().out
+        assert "RUB" in out and "--cc us" in out
 
 
 # --------------------------------------------------------------------------- #

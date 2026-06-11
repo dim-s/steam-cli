@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
@@ -47,9 +47,13 @@ class SteamError(Exception):
     on the failure kind without parsing the message.
     """
 
-    def __init__(self, message: str, code: str = "error") -> None:
+    def __init__(self, message: str, code: str = "error",
+                 status: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+        # HTTP status when known (curl path maps exit 22 → an http error); lets
+        # the retry loop decide retriability without re-parsing the message.
+        self.status = status
 
 
 # ----- locale normalization ------------------------------------------------
@@ -323,7 +327,10 @@ def _get_curl(url: str, timeout: float, insecure: bool,
             "to fall back to. Set STEAM_CLI_HTTP=urllib and fix the cert "
             "store, or install curl."
         )
-    cmd = [curl, "-fsSL", "--max-time", str(int(timeout)), "-A", USER_AGENT]
+    # int(timeout) floors a sub-second timeout to 0, which curl reads as "no
+    # limit" — the opposite of intent. ceil to whole seconds, never below 1.
+    max_time = str(max(1, math.ceil(timeout)))
+    cmd = [curl, "-fsSL", "--max-time", max_time, "-A", USER_AGENT]
     if insecure:
         cmd.append("-k")
     if cookie:
@@ -331,9 +338,24 @@ def _get_curl(url: str, timeout: float, insecure: bool,
     cmd.append(url)
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
-        msg = proc.stderr.decode("utf-8", "replace").strip() or f"curl exit {proc.returncode}"
-        raise SteamError(f"HTTP request failed: {msg}", code="network")
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        if proc.returncode == 22:        # curl -f: server returned HTTP >= 400
+            status = _curl_http_status(err)
+            raise SteamError(
+                f"HTTP {status} for {url}" if status else (err or "curl HTTP error"),
+                code="http", status=status)
+        raise SteamError(f"HTTP request failed: {err or f'curl exit {proc.returncode}'}",
+                         code="network")
     return proc.stdout
+
+
+def _curl_http_status(stderr: str) -> int | None:
+    """Pull the HTTP status out of curl's exit-22 stderr.
+
+    curl -f writes e.g. "curl: (22) The requested URL returned error: 404";
+    prefer that exact phrasing, fall back to any standalone 3-digit number."""
+    m = re.search(r"returned error:\s*(\d{3})", stderr) or re.search(r"\b(\d{3})\b", stderr)
+    return int(m.group(1)) if m else None
 
 
 def _is_tls_error(err: urllib.error.URLError) -> bool:
@@ -369,8 +391,14 @@ def _http_get_network(url: str, timeout: float, insecure: bool,
         return _get_curl(url, timeout, insec, cookie=cookie) if cookie \
             else _get_curl(url, timeout, insec)
 
+    # Forced curl / sticky fallback / insecure: curl owns the request and gets
+    # the full retry budget.
     if _HTTP_MODE == "curl" or _curl_fallback or insecure:
-        return curl_get(insecure)
+        return _retry_get(lambda: curl_get(insecure), url)
+
+    # urllib first, with a one-time TLS fallback to curl. The fallback hands a
+    # FRESH retry budget to curl (not the leftover urllib attempts), so a curl
+    # blip after the switch still gets the full 429/5xx/network retry schedule.
     last: Exception | None = None
     for attempt in range(_MAX_RETRIES):
         try:
@@ -384,7 +412,7 @@ def _http_get_network(url: str, timeout: float, insecure: bool,
         except urllib.error.URLError as e:
             if _HTTP_MODE == "auto" and _is_tls_error(e) and shutil.which("curl"):
                 _curl_fallback = True  # remember for the rest of the run
-                return curl_get(False)
+                return _retry_get(lambda: curl_get(False), url)
             if _is_tls_error(e):
                 # TLS interception with no curl to fall back to — retrying
                 # the same handshake won't help.
@@ -394,6 +422,42 @@ def _http_get_network(url: str, timeout: float, insecure: bool,
                 time.sleep(2 ** attempt)
                 continue
             raise SteamError(f"Network error: {e}", code="network") from e
+    raise SteamError(f"Network error: {last}", code="network")  # pragma: no cover
+
+
+def _retry_get(getter, url: str) -> bytes:
+    """Run `getter` under the shared retry/backoff policy.
+
+    Transient HTTP (429/5xx) and network blips back off (2**attempt) and retry;
+    a hard failure raises immediately. The curl path raises a SteamError (code
+    http/network, with `.status`); the urllib path raises urllib.error.* — both
+    are normalised here so either backend retries identically."""
+    last: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return getter()
+        except urllib.error.HTTPError as e:
+            if _retriable_status(e.code) and attempt < _MAX_RETRIES - 1:
+                last = e
+                time.sleep(2 ** attempt)
+                continue
+            raise SteamError(f"HTTP {e.code} for {url}", code="http") from e
+        except urllib.error.URLError as e:
+            if attempt < _MAX_RETRIES - 1:
+                last = e
+                time.sleep(2 ** attempt)
+                continue
+            raise SteamError(f"Network error: {e}", code="network") from e
+        except SteamError as e:
+            # retry a transient HTTP (429/5xx) or any network error; a hard HTTP
+            # (4xx) or a config error (no curl, code="error") raises straight out.
+            retriable = (e.code == "network"
+                         or (e.code == "http" and _retriable_status(e.status or 0)))
+            if retriable and attempt < _MAX_RETRIES - 1:
+                last = e
+                time.sleep(2 ** attempt)
+                continue
+            raise
     raise SteamError(f"Network error: {last}", code="network")  # pragma: no cover
 
 
@@ -455,7 +519,11 @@ def _grouped(n) -> str:
 
 def _flatten(text: str, limit: int = 280) -> str:
     text = " ".join((text or "").split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    # limit <= 0 means "no truncation" (the documented `--maxlength 0` = full);
+    # a positive limit clips and appends an ellipsis.
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _ts(epoch) -> str:
@@ -701,8 +769,12 @@ def _print_reviews(appid: int, s: dict, reviews: list[dict], args) -> None:
     print(f"[showing {len(reviews)} · filter={args.filter}]\n")
     for r in reviews:
         mark = "▲" if r.get("voted_up") else "▼"
-        author = r.get("author", {})
-        hours = round(author.get("playtime_at_review", author.get("playtime_forever", 0)) / 60)
+        # author may be null and either playtime field may be null — mirror
+        # _review_to_row / _filter_reviews: coalesce to {} and `or 0` so a
+        # degenerate review renders instead of crashing with a bare traceback.
+        author = r.get("author", {}) or {}
+        mins = author.get("playtime_at_review", author.get("playtime_forever", 0)) or 0
+        hours = round(mins / 60)
         funny = r.get("votes_funny", 0)
         extra = f" · {funny} funny" if funny else ""
         head = f"{mark} {_ts(r.get('timestamp_created'))} · {hours}h{extra}"
@@ -1048,11 +1120,22 @@ def cmd_overview(args) -> int:
     if args.estimate:
         rs = overview.get("review_summary") or {}
         p = overview.get("price") or {}
-        # full (pre-discount) price is the right baseline for a revenue proxy
-        price_cents = None if is_free else (p.get("initial") or p.get("final"))
-        overview["sales_estimate"] = _boxleiter_estimate(
-            rs.get("total_reviews"), price_cents=price_cents,
-            multiplier=args.multiplier)
+        currency = p.get("currency")
+        # appdetails returns price in the --cc region's currency; a non-USD
+        # figure must NOT be fed to a USD revenue proxy (e.g. cc=ru gives RUB
+        # kopecks). Only pass the price through when it's actually USD; otherwise
+        # revenue stays n/a and we say why. full (pre-discount) price is the
+        # right baseline for the proxy.
+        price_cents = None
+        if not is_free and currency == "USD":
+            price_cents = p.get("initial") or p.get("final")
+        est = _boxleiter_estimate(rs.get("total_reviews"), price_cents=price_cents,
+                                  multiplier=args.multiplier)
+        if est and price_cents is None and not is_free and currency and currency != "USD":
+            est["revenue_note"] = (
+                f"revenue omitted: price is in {currency}, not USD "
+                f"(re-run with `--cc us` for a revenue estimate)")
+        overview["sales_estimate"] = est
     if args.json:
         _emit_json(overview)
         return 0
@@ -1120,7 +1203,9 @@ def _print_estimate(est: dict | None) -> None:
             line += f"  ·  ≈ ${_grouped(rev[label])} gross"
         print(line)
     if rev is None:
-        print("  (revenue n/a — game is free or price unknown)")
+        note = est.get("revenue_note")
+        print(f"  ({note})" if note else
+              "  (revenue n/a — game is free or price unknown)")
     print(f"  from {_grouped(est['total_reviews'])} reviews"
           + (f" × ${est['price_usd']:.2f}" if est.get("price_usd") else "")
           + "; owners/revenue are order-of-magnitude, not exact.")
@@ -1219,11 +1304,17 @@ def _print_images(appid: int, outdir: str, results: list[dict]) -> None:
 
 def cmd_cache(args) -> int:
     if args.path:                    # script-friendly: just the directory
-        print(_CACHE.dir)
+        if args.json:
+            _emit_json({"dir": _CACHE.dir})
+        else:
+            print(_CACHE.dir)
         return 0
     if args.clear:
         n = _cache_clear()
-        print(f"cleared {n} cache files from {_CACHE.dir}")
+        if args.json:
+            _emit_json({"cleared": n, "dir": _CACHE.dir})
+        else:
+            print(f"cleared {n} cache files from {_CACHE.dir}")
         return 0
     # default: human summary of where the cache is and how big it is
     files, total, entries = 0, 0, 0
@@ -1240,6 +1331,10 @@ def cmd_cache(args) -> int:
                 entries += 1
     except OSError:
         pass
+    if args.json:
+        _emit_json({"dir": _CACHE.dir, "entries": entries,
+                    "files": files, "bytes": total})
+        return 0
     print(f"cache dir: {_CACHE.dir}")
     print(f"entries:   {entries}  ({files} files, {_grouped(total)} bytes)")
     print("clear with `steam-cli cache --clear`")
@@ -1310,8 +1405,20 @@ def cmd_top_sellers(args) -> int:
 def _profile_url(ident: str) -> str:
     ident = ident.strip()
     if "steamcommunity.com" in ident:        # accept a pasted profile URL
-        # urlparse drops any ?query / #fragment so they can't leak into the id
-        ident = urllib.parse.urlparse(ident).path.strip("/").rsplit("/", 1)[-1]
+        # urlparse drops any ?query / #fragment so they can't leak into the id.
+        parts = [p for p in urllib.parse.urlparse(ident).path.split("/") if p]
+        # The id is the segment right AFTER the /id/ or /profiles/ marker — not
+        # the last path segment, which may be a sub-page (/badges, /screenshots,
+        # /id/gaben/badges → "gaben", not "badges"). Fall back to the last
+        # segment for a bare /<something>/ URL with no marker.
+        picked = ""
+        for marker in ("id", "profiles"):
+            if marker in parts:
+                i = parts.index(marker)
+                if i + 1 < len(parts):
+                    picked = parts[i + 1]
+                break
+        ident = picked or (parts[-1] if parts else "")
     ident = ident.strip("/")
     if not ident:
         raise SteamError("profile id is empty; pass a steamID64 or vanity name",
@@ -1652,7 +1759,7 @@ def _print_browse(items: list[dict], total: int, names: list[str], args) -> None
           f"[{' · '.join(filt)}]  [cc={args.cc}]")
     print(f"Showing top {len(items)}:\n")
     for it in items:
-        print(f"{it['appid']:>8}  {it['name']}")
+        print(f"{it['appid']:>8}  {it.get('name') or '—'}")
     if total > len(items):
         print(f"\n… {_grouped(total - len(items))} more (raise --count).")
 
@@ -2051,6 +2158,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print only the cache directory path")
     ca.add_argument("--clear", action="store_true",
                     help="delete all cached files")
+    # cache is local-only, so the network flags from add_common would be
+    # meaningless — but --json must work on every command (epilog contract).
+    ca.add_argument("--json", action="store_true", help="emit raw JSON")
     ca.set_defaults(func=cmd_cache)
 
     # price
