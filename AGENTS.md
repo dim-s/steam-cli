@@ -1,6 +1,7 @@
 # AGENTS.md — steam-cli
 
-Guidance for AI coding agents (Codex CLI, opencode, Cursor, Aider, and any
+Guidance for AI coding agents (Codex CLI, opencode, Cursor, Aider, Claude Code
+— which loads this via `@AGENTS.md` from the project `CLAUDE.md` — and any
 other agent that reads `AGENTS.md`). There's also a portable **Agent Skill** in
 [`skill/`](./skill) (open `SKILL.md` format — works in Claude Code, Codex CLI,
 opencode, Cursor, …) that loads on demand; see the README to install it.
