@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import concurrent.futures
 import csv
 import hashlib
 import html
@@ -25,13 +26,14 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
@@ -227,9 +229,10 @@ def _cache_paths(url: str) -> tuple[str, str]:
 def _atomic_write(path: str, data: bytes) -> None:
     # tmp lives in the SAME directory as the target so os.replace stays atomic
     # on Windows (cross-volume replace raises). os.replace is atomic on POSIX.
-    # The pid suffix keeps two concurrent writers of the same URL from
-    # truncating each other's in-progress tmp file.
-    tmp = f"{path}.{os.getpid()}.tmp"
+    # The pid+thread suffix keeps two concurrent writers of the same URL from
+    # truncating each other's in-progress tmp file — including two THREADS of one
+    # process, now that overview/price fan requests out over a thread pool.
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "wb") as fh:
         fh.write(data)
     os.replace(tmp, path)
@@ -336,7 +339,11 @@ def _get_curl(url: str, timeout: float, insecure: bool,
     if cookie:
         cmd += ["-b", cookie]
     cmd.append(url)
-    proc = subprocess.run(cmd, capture_output=True)
+    # Force curl's own messages to the C locale so its exit-22 stderr carries the
+    # stable English "returned error: NNN" phrasing that _curl_http_status keys
+    # on — a localized curl would otherwise translate it and hide the status.
+    proc = subprocess.run(cmd, capture_output=True,
+                          env={**os.environ, "LC_ALL": "C"})
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         if proc.returncode == 22:        # curl -f: server returned HTTP >= 400
@@ -352,9 +359,12 @@ def _get_curl(url: str, timeout: float, insecure: bool,
 def _curl_http_status(stderr: str) -> int | None:
     """Pull the HTTP status out of curl's exit-22 stderr.
 
-    curl -f writes e.g. "curl: (22) The requested URL returned error: 404";
-    prefer that exact phrasing, fall back to any standalone 3-digit number."""
-    m = re.search(r"returned error:\s*(\d{3})", stderr) or re.search(r"\b(\d{3})\b", stderr)
+    curl -f (under the forced C locale) writes "curl: (22) The requested URL
+    returned error: 404" — key strictly on that phrasing. A blind fall-back to
+    any standalone 3-digit number is deliberately avoided: it would misread an
+    appid/port echoed elsewhere in the message as the status and mis-classify
+    retriability. Unknown → None (status unknown, not a fabricated number)."""
+    m = re.search(r"returned error:\s*(\d{3})", stderr)
     return int(m.group(1)) if m else None
 
 
@@ -497,10 +507,19 @@ def resolve_appid(game: str, *, cc: str = "us", lang: str = "en",
         raise SteamError(f'No Steam app found for "{game}". Try `steam-cli search "{game}"`.',
                          code="not_found")
     top = items[0]
+    # storesearch normally yields a numeric "id", but a malformed/edge item
+    # (bundle, missing field, non-numeric id) must surface as a machine-readable
+    # parse error — not a bare KeyError/ValueError escaping into an empty stdout.
+    try:
+        appid = int(top["id"])
+    except (KeyError, ValueError, TypeError) as e:
+        raise SteamError(
+            f'Steam store search returned an unusable result for "{game}" '
+            f"(no numeric appid).", code="parse") from e
     if not quiet:
-        print(f'→ resolved "{game}" to appid {top["id"]} ({top.get("name", "?")})',
+        print(f'→ resolved "{game}" to appid {appid} ({top.get("name", "?")})',
               file=sys.stderr)
-    return int(top["id"])
+    return appid
 
 
 # ----- formatting helpers --------------------------------------------------
@@ -588,11 +607,13 @@ def _review_summary(appid: int, *, language: str = "all", review_type: str = "al
 _REVIEW_CSV_COLUMNS = [
     "recommendationid", "sentiment", "date",
     "playtime_at_review_hours", "playtime_forever_hours",
+    "playtime_last_two_weeks_hours",
     "votes_up", "votes_funny", "weighted_vote_score", "comment_count",
-    "steam_purchase", "received_for_free", "language",
-    "author_steamid", "author_num_reviews", "review",
+    "steam_purchase", "received_for_free", "refunded",
+    "early_access", "steam_deck", "language",
+    "author_steamid", "author_personaname", "author_num_games_owned",
+    "author_num_reviews", "review",
 ]
-
 
 def _csv_cell(v):
     """Neutralize spreadsheet formula injection from user-controlled text:
@@ -611,6 +632,8 @@ def _review_to_row(r: dict) -> dict:
         "date": _ts(r.get("timestamp_created")),
         "playtime_at_review_hours": round((a.get("playtime_at_review") or 0) / 60, 1),
         "playtime_forever_hours": round((a.get("playtime_forever") or 0) / 60, 1),
+        "playtime_last_two_weeks_hours":
+            round((a.get("playtime_last_two_weeks") or 0) / 60, 1),
         "votes_up": r.get("votes_up"),
         "votes_funny": r.get("votes_funny"),
         "weighted_vote_score": r.get("weighted_vote_score"),
@@ -618,20 +641,40 @@ def _review_to_row(r: dict) -> dict:
         # 1/0, not Python "True"/"False" — spreadsheets treat those as text
         "steam_purchase": 1 if r.get("steam_purchase") else 0,
         "received_for_free": 1 if r.get("received_for_free") else 0,
+        "refunded": 1 if r.get("refunded") else 0,
+        "early_access": 1 if r.get("written_during_early_access") else 0,
+        "steam_deck": 1 if r.get("primarily_steam_deck") else 0,
         "language": r.get("language"),
         "author_steamid": a.get("steamid"),
+        "author_personaname": a.get("personaname"),
+        "author_num_games_owned": a.get("num_games_owned"),
         "author_num_reviews": a.get("num_reviews"),
         # flatten whitespace so each review is one tidy single-line cell
         "review": " ".join((r.get("review") or "").split()),
     }
 
 
-def _dump_reviews_csv(fh, reviews: list[dict], lineterminator: str) -> None:
+def _csv_row(row: dict, *, excel: bool) -> dict:
+    out = {}
+    for k, v in row.items():
+        # The 17-digit steamid is the one field Excel corrupts — it parses the
+        # number as a float and rounds past 15 significant digits. ="12345…"
+        # forces text in the Excel-targeted (BOM) file; the stdout path
+        # (excel=False) stays a clean bare number for pipes/pandas.
+        if excel and k == "author_steamid" and v is not None:
+            out[k] = f'="{v}"'
+        else:
+            out[k] = _csv_cell(v)
+    return out
+
+
+def _dump_reviews_csv(fh, reviews: list[dict], lineterminator: str,
+                      *, excel: bool = False) -> None:
     w = csv.DictWriter(fh, fieldnames=_REVIEW_CSV_COLUMNS,
                        lineterminator=lineterminator)
     w.writeheader()
     for r in reviews:
-        w.writerow({k: _csv_cell(v) for k, v in _review_to_row(r).items()})
+        w.writerow(_csv_row(_review_to_row(r), excel=excel))
 
 
 def _write_reviews_csv(reviews: list[dict], output_path: str | None) -> None:
@@ -639,7 +682,7 @@ def _write_reviews_csv(reviews: list[dict], output_path: str | None) -> None:
         # utf-8-sig writes a BOM so Excel detects UTF-8; newline="" + the
         # explicit \r\n terminator give clean Excel rows without CRLF doubling.
         with open(output_path, "w", encoding="utf-8-sig", newline="") as fh:
-            _dump_reviews_csv(fh, reviews, "\r\n")
+            _dump_reviews_csv(fh, reviews, "\r\n", excel=True)
         print(f"written to {output_path}", file=sys.stderr)
     else:
         # stdout: no BOM (breaks pipes); plain \n avoids \r\r\n on Windows text
@@ -669,6 +712,12 @@ def cmd_reviews(args) -> int:
         if args.json:
             _write_out(args.output,
                        lambda: _emit_json({"appid": appid, "query_summary": summary}))
+            return 0
+        if args.jsonl:
+            # honour the machine-parse flag: one JSON object on one line, rather
+            # than silently dropping to human text for `--summary --jsonl`.
+            _write_out(args.output, lambda: print(json.dumps(
+                {"appid": appid, "query_summary": summary}, ensure_ascii=False)))
             return 0
         _print_review_summary(appid, summary, args.language)
         return 0
@@ -707,6 +756,17 @@ def cmd_reviews(args) -> int:
 
     if not args.all:
         collected = collected[: args.num]
+
+    # `-n 0` (or any run where no page was fetched) skips the loop, so the
+    # aggregate never loads — a bare `{"query_summary": {}}` is indistinguishable
+    # from "this game has zero reviews". Backfill it with one num_per_page=0 call
+    # so the count is always real, not silently empty.
+    if not summary:
+        summary = _review_summary(appid, language=args.language,
+                                  review_type=args.review_type,
+                                  purchase_type=args.purchase_type,
+                                  offtopic=args.offtopic,
+                                  insecure=args.insecure, timeout=args.timeout)
 
     if args.min_playtime is not None or args.since:
         before = len(collected)
@@ -759,7 +819,11 @@ def _print_review_summary(appid: int, s: dict, language: str) -> None:
     neg = s.get("total_negative", 0)
     pct = f"{round(100 * pos / tot)}%" if tot else "n/a"
     desc = s.get("review_score_desc", "?")
-    print(f"appid {appid} — {desc} ({pct} positive)")
+    score = s.get("review_score")
+    # review_score is Steam's own 0-9 sentiment tier; surfacing it lets a human
+    # rank games without eyeballing the description (--json already carries it).
+    score_txt = f" [score {score}/9]" if score is not None else ""
+    print(f"appid {appid} — {desc} ({pct} positive){score_txt}")
     print(f"{_grouped(tot)} reviews · {_grouped(pos)} ▲ / {_grouped(neg)} ▼"
           f"  [language={language}]")
 
@@ -893,25 +957,47 @@ def _print_sysreqs(data: dict) -> None:
 
 
 def cmd_price(args) -> int:
-    regions = [normalize_country(c) for c in args.cc.split(",") if c.strip()] or ["us"]
+    # De-dup regions preserving first-seen order: `--cc us,de,us` (a typo, or an
+    # agent building the list programmatically) must not fetch the same region
+    # twice — and, once fetches run on a thread pool, two threads writing the
+    # same cache URL would race the tmp file.
+    regions: list[str] = []
+    seen_cc: set[str] = set()
+    for c in args.cc.split(","):
+        if not c.strip():
+            continue
+        cc = normalize_country(c)
+        if cc not in seen_cc:
+            seen_cc.add(cc)
+            regions.append(cc)
+    if not regions:
+        regions = ["us"]
     appid = resolve_appid(args.game, cc=regions[0], lang="en",
                           insecure=args.insecure, quiet=args.json or args.quiet,
                           timeout=args.timeout)
-    results: list[dict] = []
-    for cc in regions:
+
+    def fetch_region(cc: str) -> dict:
         try:
             data = _appdetails(appid, cc, "en", filters="price_overview,basic",
                                insecure=args.insecure, timeout=args.timeout)
         except SteamError as e:
             # one unavailable region must not sink the whole comparison
-            results.append({"cc": cc, "error": str(e)})
-            continue
-        results.append({
+            return {"cc": cc, "error": str(e)}
+        return {
             "cc": cc,
             "name": data.get("name", f"appid {appid}"),
             "is_free": bool(data.get("is_free")),
             "price_overview": data.get("price_overview"),
-        })
+        }
+
+    # regions are independent appdetails calls — fetch them concurrently (via the
+    # shared soft-fetch primitive) so a multi-region comparison costs one
+    # round-trip of latency, not one per cc. The helper preserves job order, so
+    # output stays deterministic; regions were de-duped above so no two jobs race
+    # the same cache URL. fetch_region handles its own errors (returns a {cc,error}
+    # row), so the None-on-SteamError degrade path is simply never taken here.
+    jobs = {cc: (lambda c=cc: fetch_region(c)) for cc in regions}
+    results = list(_fetch_soft_concurrent(jobs).values())
     if args.json:
         _emit_json({"appid": appid, "regions": results})
         return 0
@@ -949,7 +1035,10 @@ def cmd_search(args) -> int:
     args.lang = normalize_language(args.lang)
     items = store_search(args.term, cc=args.cc, lang=args.lang,
                          insecure=args.insecure, timeout=args.timeout)
-    items = items[: args.limit]
+    # match every sibling command: positive limit caps, 0 = all, negative ignored
+    # (a bare items[:args.limit] would silently slice from the end on --limit -1).
+    if args.limit and args.limit > 0:
+        items = items[: args.limit]
     if args.json:
         _emit_json(items)
         return 0
@@ -963,7 +1052,8 @@ def cmd_search(args) -> int:
             ptxt = f"{cents / 100:.2f} {price.get('currency', '')}" if cents else "free/—"
         else:
             ptxt = "—"
-        print(f"{it.get('id'):>8}  {it.get('name', '?')}  [{it.get('type', '?')}]  {ptxt}")
+        print(f"{str(it.get('id') or '?'):>8}  {it.get('name', '?')}  "
+              f"[{it.get('type', '?')}]  {ptxt}")
     return 0
 
 
@@ -1066,6 +1156,48 @@ def cmd_achievements(args) -> int:
 
 # ----- subcommand: overview ------------------------------------------------
 
+# Cap on concurrent Steam sockets from one command: a caller that builds a huge
+# job set (e.g. `price --cc` with dozens of regions) must not open them all at
+# once and self-inflict a 429 on a key-free API — the same "stay a good citizen"
+# guard `browse --count` applies to its own fan-out. It bounds concurrency, not
+# the total number of results the caller asked for.
+_MAX_CONCURRENT_FETCHES = 8
+
+
+def _fetch_soft_concurrent(jobs: dict) -> dict:
+    """Run independent fetches on a thread pool, each degrading to None on
+    SteamError — same contract as a sequential soft() call, but the network
+    round-trips overlap. Steam calls are I/O-bound (urllib/curl release the GIL
+    while waiting), so N independent requests cost ~one round-trip of wall-clock
+    instead of N. Results come back keyed by the caller's job keys, in the SAME
+    order the jobs were given (handy when the caller wants an ordered list).
+
+    Thread-safety note: every job MUST hit a DISTINCT cache URL. The on-disk
+    cache tolerates concurrent writers of *different* URLs (per-URL paths, a
+    pid+thread tmp suffix), but two jobs writing the SAME URL would race — so
+    callers de-dup first (see cmd_price)."""
+    if not jobs:
+        return {}
+
+    def soft(fn):
+        try:
+            return fn()
+        except SteamError:
+            return None
+
+    out = {key: None for key in jobs}          # seed in caller's order
+    workers = min(len(jobs), _MAX_CONCURRENT_FETCHES)
+    if workers <= 1:
+        for key, fn in jobs.items():
+            out[key] = soft(fn)
+        return out
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(soft, fn): key for key, fn in jobs.items()}
+        for fut in concurrent.futures.as_completed(futures):
+            out[futures[fut]] = fut.result()
+    return out
+
+
 def cmd_overview(args) -> int:
     """One resolve, one JSON: store card + live players + review headline +
     price — so an agent answering "tell me about <game>" needs a single call
@@ -1078,17 +1210,25 @@ def cmd_overview(args) -> int:
     data = _appdetails(appid, args.cc, "english", insecure=args.insecure,
                        timeout=args.timeout)
 
-    def soft(fn):
-        # players / reviews are nice-to-have: degrade to null, don't fail.
-        try:
-            return fn()
-        except SteamError:
-            return None
-
-    players = soft(lambda: _current_players(appid, insecure=args.insecure,
-                                            timeout=args.timeout))
-    review_summary = soft(lambda: _review_summary(appid, insecure=args.insecure,
-                                                   timeout=args.timeout))
+    # players / reviews (and opt-in news / achievements) only need the resolved
+    # appid, not each other — fetch them concurrently so the flagship command
+    # pays one round-trip of latency, not three-to-five sequential ones.
+    jobs = {
+        "players": lambda: _current_players(
+            appid, insecure=args.insecure, timeout=args.timeout),
+        "review_summary": lambda: _review_summary(
+            appid, insecure=args.insecure, timeout=args.timeout),
+    }
+    if args.news:
+        jobs["news"] = lambda: _news_items(
+            appid, count=args.news, insecure=args.insecure, timeout=args.timeout)
+    if args.top_achievements:
+        jobs["top_achievements"] = lambda: _achievement_percentages(
+            appid, insecure=args.insecure, timeout=args.timeout
+        )[: args.top_achievements]
+    fetched = _fetch_soft_concurrent(jobs)
+    players = fetched["players"]
+    review_summary = fetched["review_summary"]
     is_free = bool(data.get("is_free"))
     rd = data.get("release_date", {}) or {}
     overview = {
@@ -1110,13 +1250,11 @@ def cmd_overview(args) -> int:
         "store_url": f"{STORE}/app/{appid}/",
     }
     # opt-in soft sections: included only when requested, null on failure.
+    # Already fetched concurrently above — just surface them under their keys.
     if args.news:
-        overview["news"] = soft(lambda: _news_items(
-            appid, count=args.news, insecure=args.insecure, timeout=args.timeout))
+        overview["news"] = fetched.get("news")
     if args.top_achievements:
-        overview["top_achievements"] = soft(lambda: _achievement_percentages(
-            appid, insecure=args.insecure, timeout=args.timeout
-        )[: args.top_achievements])
+        overview["top_achievements"] = fetched.get("top_achievements")
     if args.estimate:
         rs = overview.get("review_summary") or {}
         p = overview.get("price") or {}
@@ -1394,6 +1532,14 @@ def cmd_specials(args) -> int:
 
 def cmd_top_sellers(args) -> int:
     return _run_featured(args, "top_sellers", "Top sellers")
+
+
+def cmd_coming_soon(args) -> int:
+    return _run_featured(args, "coming_soon", "Coming soon (pre-release)")
+
+
+def cmd_new_releases(args) -> int:
+    return _run_featured(args, "new_releases", "New releases")
 
 
 # ----- subcommand: profile -------------------------------------------------
@@ -1731,13 +1877,25 @@ def _search_results(tag_ids: list[int], *, sort: str = "reviews",
     return items[:count], total
 
 
+_BROWSE_COUNT_CAP = 1000  # safety valve: each 100 rows is one sequential request
+
+
 def cmd_browse(args) -> int:
     args.cc = normalize_country(args.cc)
     names = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
     tag_ids = _resolve_tag_ids(names, insecure=args.insecure,
                                timeout=args.timeout) if names else []
+    # cap --count so an over-large value (e.g. --count 100000) can't fan out into
+    # hundreds of sequential HTTP round-trips — same class of guard the project
+    # applies to `reviews --all`. niche_size still reports the true full total.
+    count = args.count if args.count > 0 else 20
+    if count > _BROWSE_COUNT_CAP:
+        if not (args.json or args.quiet):
+            print(f"→ capping --count to {_BROWSE_COUNT_CAP} (niche_size still "
+                  "reports the full match total)", file=sys.stderr)
+        count = _BROWSE_COUNT_CAP
     items, total = _search_results(
-        tag_ids, sort=args.sort, max_price=args.max_price, count=args.count,
+        tag_ids, sort=args.sort, max_price=args.max_price, count=count,
         cc=args.cc, insecure=args.insecure, timeout=args.timeout)
     if args.json:
         _emit_json({"tags": names, "tag_ids": tag_ids, "sort": args.sort,
@@ -2091,6 +2249,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name, fn, helptext in (
         ("specials", cmd_specials, "games currently on sale (featured specials)"),
         ("top-sellers", cmd_top_sellers, "current top-selling games"),
+        ("coming-soon", cmd_coming_soon, "upcoming pre-release games (front page)"),
+        ("new-releases", cmd_new_releases, "recently released games (front page)"),
     ):
         fp = sub.add_parser(name, help=helptext)
         fp.add_argument("--cc", default="us", help="country code (region for prices)")
@@ -2218,6 +2378,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
+    except Exception as e:  # last-resort contract guard
+        # An unexpected bug (unforeseen response shape, KeyError, TypeError…)
+        # must NOT leave a --json consumer with an empty stdout + traceback:
+        # the "--json always yields a JSON object" contract holds even here.
+        if getattr(args, "json", False):
+            _emit_json({"error": f"{type(e).__name__}: {e}", "code": "internal"})
+            return 1
+        raise
 
 
 if __name__ == "__main__":

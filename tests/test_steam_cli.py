@@ -374,6 +374,29 @@ class TestGetCurl:
         assert ei.value.code == "http"
         assert ei.value.status == 404
 
+    def test_status_no_blind_3digit_fallback(self):
+        # F4 — a stderr WITHOUT the "returned error: NNN" phrasing (e.g. a
+        # localized curl) must yield None, not latch onto an unrelated 3-digit
+        # run like an appid/port echoed elsewhere → no retriability mis-classify.
+        assert steam_cli._curl_http_status(
+            "curl: (22) fallo con appids=570 en la URL") is None
+        assert steam_cli._curl_http_status(
+            "curl: (22) The requested URL returned error: 503") == 503
+
+    def test_forces_c_locale_for_stable_status_phrasing(self, monkeypatch):
+        # F4 — the curl subprocess runs under LC_ALL=C so its exit-22 message
+        # stays the English "returned error: NNN" that _curl_http_status parses.
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["env"] = kw.get("env")
+            return SimpleNamespace(returncode=0, stdout=b"OK", stderr=b"")
+
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
+        steam_cli._get_curl("http://x", 30.0, insecure=False)
+        assert seen["env"] is not None and seen["env"].get("LC_ALL") == "C"
+
     def test_genuine_network_exit_is_network_error(self, monkeypatch):
         # a non-22 exit (e.g. 7 connection refused) stays a network error
         monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
@@ -1873,6 +1896,16 @@ def _featured_resp():
              "original_price": 3000, "final_price": 3000, "currency": "USD",
              "header_image": "http://img/b"},
         ]},
+        "coming_soon": {"items": [
+            {"id": 3, "name": "Game C", "discounted": False, "discount_percent": 0,
+             "original_price": None, "final_price": None, "currency": "USD",
+             "header_image": "http://img/c"},
+        ]},
+        "new_releases": {"items": [
+            {"id": 4, "name": "Game D", "discounted": False, "discount_percent": 0,
+             "original_price": 1500, "final_price": 1500, "currency": "USD",
+             "header_image": "http://img/d"},
+        ]},
     }
 
 
@@ -1892,6 +1925,22 @@ class TestSpecialsTop:
         d = json.loads(capsys.readouterr().out)
         assert d["section"] == "top_sellers"
         assert d["items"][0]["name"] == "Game B"
+
+    def test_coming_soon_json(self, stub_json, capsys):
+        # F8: coming_soon rides the SAME featuredcategories response already
+        # fetched for specials/top-sellers — surfacing it costs no extra request.
+        stub_json(_featured_resp())
+        steam_cli.cmd_coming_soon(make_args(["coming-soon", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["section"] == "coming_soon"
+        assert d["items"][0]["name"] == "Game C"
+
+    def test_new_releases_json(self, stub_json, capsys):
+        stub_json(_featured_resp())
+        steam_cli.cmd_new_releases(make_args(["new-releases", "--json"]))
+        d = json.loads(capsys.readouterr().out)
+        assert d["section"] == "new_releases"
+        assert d["items"][0]["name"] == "Game D"
 
     def test_limit_caps(self, stub_json, capsys):
         stub_json({"specials": {"items": [{"id": i, "name": f"G{i}"} for i in range(10)]}})
@@ -2541,3 +2590,231 @@ class TestReconParser:
     def test_invalid_sort_rejected(self):
         with pytest.raises(SystemExit):
             make_args(["browse", "--sort", "bogus"])
+
+
+# --------------------------------------------------------------------------- #
+# audit regressions (2025 pass): contract, consistency, API use, concurrency   #
+# --------------------------------------------------------------------------- #
+
+class TestAuditContract:
+    """F1 — a malformed Steam response must never escape as a bare traceback /
+    empty stdout under --json; the machine-readable envelope always holds."""
+
+    def test_resolve_appid_missing_id_raises_parse(self, stub_json):
+        stub_json({"items": [{"name": "Bad Item"}]})   # no "id" key
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.resolve_appid("x")
+        assert ei.value.code == "parse"
+
+    def test_resolve_appid_nonnumeric_id_raises_parse(self, stub_json):
+        stub_json({"items": [{"id": "abc"}]})
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.resolve_appid("x")
+        assert ei.value.code == "parse"
+
+    def test_main_malformed_storesearch_still_json_envelope(self, stub_json, capsys):
+        stub_json({"items": [{"name": "Bad"}]})
+        rc = steam_cli.main(["reviews", "notanappid", "--json"])
+        cap = capsys.readouterr()
+        assert rc == 1
+        assert cap.err == ""
+        assert json.loads(cap.out)["code"] == "parse"   # valid JSON, not empty
+
+    def test_unexpected_exception_json_envelope(self, monkeypatch, capsys):
+        # any non-SteamError bug under --json → internal envelope, not a traceback
+        monkeypatch.setattr(steam_cli, "http_json",
+                            lambda *a, **k: (_ for _ in ()).throw(KeyError("weird")))
+        rc = steam_cli.main(["players", "570", "--json"])
+        cap = capsys.readouterr()
+        assert rc == 1
+        assert cap.err == ""
+        assert json.loads(cap.out)["code"] == "internal"
+
+    def test_unexpected_exception_without_json_reraises(self, monkeypatch):
+        # without --json the human path still gets a real traceback (no silent swallow)
+        monkeypatch.setattr(steam_cli, "http_json",
+                            lambda *a, **k: (_ for _ in ()).throw(KeyError("weird")))
+        with pytest.raises(KeyError):
+            steam_cli.main(["players", "570"])
+
+
+class TestAuditConsistency:
+    def test_search_text_handles_missing_id(self, stub_json, capsys):
+        # F2 — a hit without a numeric id must not crash the width-formatted line
+        stub_json({"items": [{"name": "No Id Game", "type": "game"}]})
+        steam_cli.cmd_search(make_args(["search", "x"]))
+        assert "No Id Game" in capsys.readouterr().out
+
+    def test_search_limit_zero_is_all_negative_ignored(self, stub_json, capsys):
+        # F5 — align with every sibling command: 0 = all, negative = no-op
+        items = [{"id": i, "name": f"g{i}", "type": "game"} for i in range(5)]
+        stub_json({"items": items})
+        steam_cli.cmd_search(make_args(["search", "x", "--limit", "0", "--json"]))
+        assert len(json.loads(capsys.readouterr().out)) == 5
+        stub_json({"items": items})
+        steam_cli.cmd_search(make_args(["search", "x", "--limit", "-1", "--json"]))
+        assert len(json.loads(capsys.readouterr().out)) == 5   # not last-dropped
+
+    def test_browse_count_capped(self, monkeypatch, capsys):
+        # F6 — an over-large --count can't fan out into hundreds of requests
+        seen = {}
+
+        def fake(tag_ids, **kw):
+            seen["count"] = kw["count"]
+            return ([], 0)
+
+        monkeypatch.setattr(steam_cli, "_search_results", fake)
+        steam_cli.cmd_browse(make_args(["browse", "--count", "100000", "--json"]))
+        assert seen["count"] == steam_cli._BROWSE_COUNT_CAP
+
+
+class TestAuditReviews:
+    def test_n0_still_fetches_summary(self, stub_json, capsys):
+        # F3 — -n 0 must still report the real aggregate, not a silent empty {}
+        stub = stub_json({"success": 1, "query_summary": {
+            "total_reviews": 42, "total_positive": 40, "total_negative": 2,
+            "review_score_desc": "Very Positive"}})
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "0", "--json", "--delay", "0"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["query_summary"]["total_reviews"] == 42
+        assert obj["count"] == 0
+        assert any(c.params.get("num_per_page") == 0 for c in stub.calls)
+
+    def test_summary_jsonl_emits_one_json_line(self, stub_json, capsys):
+        # F4 — --summary --jsonl must honour the machine flag, not print human text
+        stub_json({"success": 1, "query_summary": {
+            "total_reviews": 10, "total_positive": 8, "total_negative": 2,
+            "review_score_desc": "Mostly Positive"}})
+        steam_cli.cmd_reviews(make_args(["reviews", "1", "--summary", "--jsonl"]))
+        out = capsys.readouterr().out.strip()
+        assert out.count("\n") == 0
+        assert json.loads(out)["query_summary"]["total_reviews"] == 10
+
+    def test_summary_human_shows_review_score(self, stub_json, capsys):
+        # F10 — the 0-9 tier is surfaced in the human summary line
+        stub_json({"success": 1, "query_summary": {
+            "total_reviews": 10, "total_positive": 9, "total_negative": 1,
+            "review_score": 8, "review_score_desc": "Very Positive"}})
+        steam_cli.cmd_reviews(make_args(["reviews", "1", "--summary"]))
+        assert "score 8/9" in capsys.readouterr().out
+
+
+class TestAuditCsvFields:
+    def test_new_analytic_fields_populated(self, stub_json, tmp_path):
+        # F9 — refunded / early-access / deck / author extras reach the CSV
+        import csv as _csv
+        rev = review(1)
+        rev["refunded"] = True
+        rev["written_during_early_access"] = True
+        rev["primarily_steam_deck"] = True
+        rev["author"].update({"personaname": "Alice", "num_games_owned": 42,
+                              "playtime_last_two_weeks": 120})
+        stub_json([review_page([rev], cursor="C1")])
+        path = tmp_path / "r.csv"
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "1", "--delay", "0", "--csv", "--output", str(path)]))
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            row = next(_csv.DictReader(fh))
+        assert row["refunded"] == "1"
+        assert row["early_access"] == "1"
+        assert row["steam_deck"] == "1"
+        assert row["author_personaname"] == "Alice"
+        assert row["author_num_games_owned"] == "42"
+        assert row["playtime_last_two_weeks_hours"] == "2.0"
+
+    def test_steamid_text_forced_in_excel_file(self, stub_json, tmp_path):
+        # F7 — 17-digit steamid forced to text so Excel doesn't round it to a float.
+        # Read through the CSV parser: Excel likewise unwraps the CSV quoting and
+        # sees the ="…" text-forcing formula, keeping full precision.
+        import csv as _csv
+        rev = review(1)
+        rev["author"]["steamid"] = "76561198000000000"
+        stub_json([review_page([rev], cursor="C1")])
+        path = tmp_path / "r.csv"
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "1", "--delay", "0", "--csv", "--output", str(path)]))
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            row = next(_csv.DictReader(fh))
+        assert row["author_steamid"] == '="76561198000000000"'
+
+    def test_steamid_bare_on_stdout(self, stub_json, capsys):
+        # stdout stays a clean bare number for pipes/pandas — no Excel escaping
+        rev = review(1)
+        rev["author"]["steamid"] = "76561198000000000"
+        stub_json([review_page([rev], cursor="C1")])
+        steam_cli.cmd_reviews(make_args(
+            ["reviews", "1", "-n", "1", "--delay", "0", "--csv"]))
+        out = capsys.readouterr().out
+        assert "76561198000000000" in out
+        assert '="76561198000000000"' not in out
+
+
+class TestAuditConcurrency:
+    def test_fetch_soft_concurrent_degrades_on_error(self):
+        # F11 — a failing soft fetch degrades to None, mirroring sequential soft()
+        out = steam_cli._fetch_soft_concurrent({
+            "a": lambda: "v",
+            "b": lambda: (_ for _ in ()).throw(steam_cli.SteamError("no")),
+        })
+        assert out == {"a": "v", "b": None}
+
+    def test_fetch_soft_concurrent_empty(self):
+        assert steam_cli._fetch_soft_concurrent({}) == {}
+
+    def test_fetch_soft_concurrent_single_runs_inline(self):
+        assert steam_cli._fetch_soft_concurrent({"a": lambda: 1}) == {"a": 1}
+
+    def test_fetch_soft_concurrent_preserves_key_order(self):
+        # jobs finishing out of order (b before a) must still return in the
+        # caller's insertion order — cmd_price relies on this for stable output
+        import time as _t
+        jobs = {
+            "a": lambda: (_t.sleep(0.03), "A")[1],
+            "b": lambda: (_t.sleep(0.01), "B")[1],
+            "c": lambda: "C",
+        }
+        out = steam_cli._fetch_soft_concurrent(jobs)
+        assert list(out.items()) == [("a", "A"), ("b", "B"), ("c", "C")]
+
+    def test_fetch_soft_concurrent_caps_worker_count(self):
+        # a large job set must not open more than _MAX_CONCURRENT_FETCHES sockets
+        # at once — the "good key-free citizen" guard against a self-inflicted 429
+        import threading as _th
+        import time as _t
+        live = {"cur": 0, "peak": 0}
+        lock = _th.Lock()
+
+        def job():
+            with lock:
+                live["cur"] += 1
+                live["peak"] = max(live["peak"], live["cur"])
+            _t.sleep(0.01)
+            with lock:
+                live["cur"] -= 1
+            return 1
+
+        steam_cli._fetch_soft_concurrent({f"j{i}": job for i in range(24)})
+        assert live["peak"] <= steam_cli._MAX_CONCURRENT_FETCHES
+
+    def test_price_dedups_regions_preserving_order(self, stub_json, capsys):
+        # F12 — --cc us,de,us fetches each region once, in first-seen order
+        stub_json(appdetails(1, {"name": "G", "is_free": False,
+                                 "price_overview": {"final_formatted": "$1"}}))
+        steam_cli.cmd_price(make_args(["price", "1", "--cc", "us,de,us", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert [r["cc"] for r in obj["regions"]] == ["us", "de"]
+
+    def test_atomic_write_tmp_includes_thread_id(self, monkeypatch, tmp_path):
+        # F12 — tmp name carries the thread id so two threads writing the same URL
+        # don't collide on the in-progress tmp file
+        captured = {}
+        real_replace = steam_cli.os.replace
+
+        def cap(src, dst):
+            captured["src"] = src
+            real_replace(src, dst)
+
+        monkeypatch.setattr(steam_cli.os, "replace", cap)
+        steam_cli._atomic_write(str(tmp_path / "f"), b"data")
+        assert str(steam_cli.threading.get_ident()) in captured["src"]

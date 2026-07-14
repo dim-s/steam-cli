@@ -69,6 +69,8 @@ freshness). Manage it with `steam-cli cache` (show size/path), `cache --path`,
 | `steam-cli price <game> [--cc us,de,ru]` | Price + discount for one or more regions |
 | `steam-cli specials` | Games currently **on sale** (featured front-page specials) |
 | `steam-cli top-sellers` | Current **top-selling** games |
+| `steam-cli coming-soon` | **Upcoming** pre-release games (front page) |
+| `steam-cli new-releases` | **Recently released** games (front page) |
 | `steam-cli tags <game>` | **User (community) tags** with vote counts — Cozy, Roguelike, Wholesome… (what `info` genres/categories miss) |
 | `steam-cli browse --tags …` | **Faceted niche search** — size *and* list a niche by tag / price / sort (the only key-free "map the niche" query) |
 | `steam-cli similar <game>` | Steam **"more like this"** recommendations (buyers-also-viewed) |
@@ -87,7 +89,7 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 | Command | Shape |
 |---|---|
 | `overview` | `{appid, name, type, release_date, coming_soon, developers, publishers, genres, metacritic, is_free, price_cc, price, players_online, review_summary, store_url, news?, top_achievements?, sales_estimate?}` (`price_cc` = the region the `price` is for; `sales_estimate` only with `--estimate`) |
-| `reviews` | `{appid, query_summary:{review_score_desc, total_reviews, total_positive, total_negative}, count, reviews:[…]}` · `--summary` → `{appid, query_summary}` · `--jsonl` → one review object per line |
+| `reviews` | `{appid, query_summary:{review_score, review_score_desc, total_reviews, total_positive, total_negative}, count, reviews:[…]}` (`review_score` = Steam's 0-9 sentiment tier) · `--summary` → `{appid, query_summary}` (also `--summary --jsonl` → one JSON line) · `--jsonl` → one review object per line · `--csv` → columns incl. `refunded`, `early_access`, `steam_deck`, `author_personaname`, `author_num_games_owned`, `playtime_last_two_weeks_hours` |
 | `info` | raw Steam appdetails object: `{steam_appid, name, type, is_free, genres:[{id, description}], release_date:{date, coming_soon}, developers, price_overview?, …}` (large) |
 | `search` | **bare array** `[{id, name, type, price?}]` — no `appid` wrapper |
 | `players` | `{appid, player_count}` |
@@ -95,7 +97,7 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 | `achievements` | **bare array** `[{name, percent}]`, sorted by `percent` desc (names are internal API ids) |
 | `price` | `{appid, regions:[{cc, name, is_free, price_overview} \| {cc, error}]}` |
 | `images` | `{appid, out, images:[{kind, url, path} \| {kind, url, error}]}` |
-| `specials` / `top-sellers` | `{section, cc, count, items:[{id, name, discounted, discount_percent, original_price, final_price, currency, header_image}]}` — **prices are integer minor units** (cents): `final_price: 899` = $8.99 |
+| `specials` / `top-sellers` / `coming-soon` / `new-releases` | `{section, cc, count, items:[{id, name, discounted, discount_percent, original_price, final_price, currency, header_image}]}` — **prices are integer minor units** (cents): `final_price: 899` = $8.99 (a pre-release item may have `null` prices) |
 | `tags` | `{appid, count, tags:[{tagid, name, count, browseable}]}` — `count` is the user vote weight; sorted high→low |
 | `browse` | `{tags, tag_ids, sort, max_price, cc, niche_size, count, items:[{appid, name, tagids}]}` — **`niche_size` is the full match count** (the niche size), `count`/`items` are the page you asked for |
 | `similar` | `{appid, count, similar:[{appid, name, tagids}]}` — `name` is derived from the store URL slug (may be null); recommendations, **not** a curated competitor set |

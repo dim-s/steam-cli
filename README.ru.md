@@ -104,7 +104,7 @@ pip install git+https://github.com/dim-s/steam-cli.git
 ### Шаг 3. Проверьте установку
 
 ```bash
-steam-cli --version       # → steam-cli 1.3.2
+steam-cli --version       # → steam-cli 1.4.0
 steam-cli overview "Hades"
 ```
 
@@ -252,9 +252,11 @@ steam-cli players 570
 steam-cli news 1145360 -c 5
 steam-cli achievements 1145360
 
-# Что в распродаже и что продаётся прямо сейчас
+# Что в распродаже, что продаётся, что скоро выйдет и что только вышло
 steam-cli specials
 steam-cli top-sellers
+steam-cli coming-soon
+steam-cli new-releases
 
 # Скачать обложку и скриншоты, чтобы агент мог *увидеть* игру
 steam-cli images 1145360 --what header screenshots --limit 4 --out ./media
@@ -277,6 +279,8 @@ steam-cli images 1145360 --what header screenshots --limit 4 --out ./media
 | `price <игра>` | Цена и скидка по одному или нескольким регионам |
 | `specials` | Игры со скидкой прямо сейчас |
 | `top-sellers` | Текущие топ-продажи |
+| `coming-soon` | Скоро выходящие игры (главная страница) |
+| `new-releases` | Недавно вышедшие игры (главная страница) |
 | `tags <игра>` | Пользовательские теги с числом голосов (Cozy, Roguelike…) |
 | `browse --tags …` | Поиск по нише: её размер и список по тегу/цене/сортировке |
 | `similar <игра>` | Набор рекомендаций «ещё похожие» |

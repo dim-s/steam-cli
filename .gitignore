@@ -6,3 +6,12 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Разовые аналитические бандлы (скрипты+данные персистят на диске, но не трекаются)
+analysis/
+
+# Скретч Playwright MCP (скриншоты / снимки страниц)
+.playwright-mcp/
+
+# Дефолтная папка выгрузки `steam-cli images` (./steam-<appid>-media/) — регенерируется
+steam-*-media/

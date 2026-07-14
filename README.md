@@ -88,9 +88,11 @@ steam-cli achievements 1145360
 # compare price across regions in one call
 steam-cli price 1145360 --cc us,de,ru,br
 
-# what's on sale / what's selling right now
+# what's on sale / selling / coming / just released right now
 steam-cli specials
 steam-cli top-sellers
+steam-cli coming-soon
+steam-cli new-releases
 
 # market recon: user tags, niche sizing, similar set, review velocity, sales scale
 steam-cli tags "Hades"                                   # discovery tags + vote weight
@@ -118,6 +120,8 @@ steam-cli profile 76561197960287930
 | `price <game>` | Price + discount for one or more regions | `store/api/appdetails` |
 | `specials` | Games currently on sale (featured specials) | `store/api/featuredcategories` |
 | `top-sellers` | Current top-selling games | `store/api/featuredcategories` |
+| `coming-soon` | Upcoming pre-release games (front page) | `store/api/featuredcategories` |
+| `new-releases` | Recently released games (front page) | `store/api/featuredcategories` |
 | `tags <game>` | User (community) tags with vote counts | `store/app` page (`InitAppTagModal`) |
 | `browse --tags …` | Faceted niche search: size + list by tag/price/sort | `store/search/results` + `store/tagdata` |
 | `similar <game>` | "More like this" recommendation set | `store/recommended/morelike` |
