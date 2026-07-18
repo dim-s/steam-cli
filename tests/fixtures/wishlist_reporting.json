@@ -1,0 +1,62 @@
+{
+  "response": {
+    "appid": 123456,
+    "date": "2020-01-15",
+    "wishlist_summary": {
+      "wishlist_adds": 40,
+      "wishlist_deletes": 6,
+      "wishlist_purchases": 9,
+      "wishlist_gifts": 1,
+      "wishlist_adds_windows": 8,
+      "wishlist_adds_mac": 2,
+      "wishlist_adds_linux": 1
+    },
+    "country_summary": [
+      {
+        "country_code": "US",
+        "summary_actions": {
+          "wishlist_adds": 17,
+          "wishlist_deletes": 2,
+          "wishlist_purchases": 4,
+          "wishlist_gifts": 1,
+          "wishlist_adds_windows": 3,
+          "wishlist_adds_mac": 1,
+          "wishlist_adds_linux": 0
+        },
+        "country_name": "United States",
+        "region": "North America"
+      },
+      {
+        "country_code": "DE",
+        "summary_actions": {
+          "wishlist_adds": 4,
+          "wishlist_deletes": 1,
+          "wishlist_purchases": 2,
+          "wishlist_gifts": 0,
+          "wishlist_adds_windows": 2,
+          "wishlist_adds_mac": 0,
+          "wishlist_adds_linux": 1
+        },
+        "country_name": "Germany",
+        "region": "Western Europe"
+      }
+    ],
+    "language_summary": [
+      {
+        "language": 0,
+        "summary_actions": {
+          "wishlist_adds": 22,
+          "wishlist_deletes": 3,
+          "wishlist_purchases": 6,
+          "wishlist_gifts": 1,
+          "wishlist_adds_windows": 5,
+          "wishlist_adds_mac": 1,
+          "wishlist_adds_linux": 0
+        },
+        "language_name": "english"
+      }
+    ],
+    "time_generated": 1579100000,
+    "app_min_date": "2019-03-01"
+  }
+}

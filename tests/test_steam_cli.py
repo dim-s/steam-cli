@@ -7,9 +7,13 @@ use small synthetic pages so the exact control flow can be pinned down.
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
+import io
 import json
 import math
 import os
+import pathlib
 import ssl
 import urllib.error
 import urllib.parse
@@ -412,6 +416,7 @@ class TestGetCurl:
 
         def fake_run(cmd, **kw):
             seen["cmd"] = cmd
+            seen["input"] = kw.get("input")
             return SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
 
         monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
@@ -419,7 +424,11 @@ class TestGetCurl:
         steam_cli._get_curl("http://x", 12.7, insecure=True)
         assert "-k" in seen["cmd"]
         assert "13" in seen["cmd"]          # --max-time ceil(12.7), never floored
-        assert seen["cmd"][-1] == "http://x"
+        # The URL travels in the -K config on stdin, never in argv, so a key in
+        # the query string can't be read out of `ps` by another user.
+        assert "http://x" not in seen["cmd"]
+        assert seen["cmd"][-2:] == ["-K", "-"]
+        assert b'url = "http://x"' in seen["input"]
 
     def test_sub_second_timeout_not_floored_to_zero(self, monkeypatch):
         # curl reads --max-time 0 as "no limit"; a sub-second timeout must clamp
@@ -2540,18 +2549,21 @@ class TestCookieThreading:
         steam_cli._get_urllib("http://x", 9.0)
         assert seen["cookie"] is None
 
-    def test_curl_adds_b_flag(self, monkeypatch):
+    def test_curl_passes_cookie_via_config(self, monkeypatch):
         seen = {}
 
         def fake_run(cmd, **kw):
             seen["cmd"] = cmd
+            seen["input"] = kw.get("input")
             return SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
 
         monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
         monkeypatch.setattr(steam_cli.subprocess, "run", fake_run)
         steam_cli._get_curl("http://x", 10.0, False, cookie="a=b")
-        assert "-b" in seen["cmd"]
-        assert seen["cmd"][seen["cmd"].index("-b") + 1] == "a=b"
+        # Cookie rides in the stdin config alongside the URL — same reason: argv
+        # is world-readable through `ps`.
+        assert "a=b" not in seen["cmd"]
+        assert b'cookie = "a=b"' in seen["input"]
 
     def test_http_get_threads_cookie_to_network(self, monkeypatch):
         seen = {}
@@ -2818,3 +2830,539 @@ class TestAuditConcurrency:
         monkeypatch.setattr(steam_cli.os, "replace", cap)
         steam_cli._atomic_write(str(tmp_path / "f"), b"data")
         assert str(steam_cli.threading.get_ident()) in captured["src"]
+
+
+# ----- publisher API key ---------------------------------------------------
+# The key is a secret. These tests are the standing proof that it does not
+# escape through the three paths that would otherwise carry it: the on-disk
+# cache, error messages, and the terminal.
+
+FAKE_KEY = "0123456789abcdef0123456789abcdef"
+OTHER_KEY = "fedcba9876543210fedcba9876543210"
+
+
+class TestApiKeyResolution:
+    def test_env_var_wins_over_config(self, monkeypatch, tmp_path):
+        steam_cli._write_config({"api_key": OTHER_KEY})
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        assert steam_cli.api_key() == FAKE_KEY
+
+    def test_falls_back_to_config_file(self):
+        steam_cli._write_config({"api_key": FAKE_KEY})
+        assert steam_cli.api_key() == FAKE_KEY
+
+    def test_alias_env_var_honoured(self, monkeypatch):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV_ALIAS, FAKE_KEY)
+        assert steam_cli.api_key() == FAKE_KEY
+
+    def test_missing_key_returns_none(self):
+        assert steam_cli.api_key() is None
+
+    def test_missing_key_raises_auth_code_when_required(self):
+        # A key-only command must fail with a machine-readable `auth` code rather
+        # than firing a request Steam would reject.
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.api_key(required_for="wishlist")
+        assert ei.value.code == "auth"
+        assert "auth --set" in str(ei.value)
+
+    def test_corrupt_config_reads_as_no_key(self, tmp_path):
+        path = pathlib.Path(steam_cli._config_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        assert steam_cli.api_key() is None
+
+
+class TestApiKeyNeverLeaks:
+    def test_key_absent_from_every_cache_file(self, monkeypatch):
+        # Both the filename and the .meta contents are checked: the meta used to
+        # store the full URL verbatim.
+        monkeypatch.setattr(steam_cli._CACHE, "enabled", True)
+        url = f"https://api.steampowered.com/x/?appid=1&key={FAKE_KEY}"
+        monkeypatch.setattr(steam_cli, "_http_get_network",
+                            lambda *a, **k: b'{"ok":1}')
+        steam_cli.http_get(url, cache_ttl=600)
+        files = list(pathlib.Path(steam_cli._CACHE.dir).iterdir())
+        assert files, "expected the response to be cached"
+        for f in files:
+            assert FAKE_KEY not in f.name
+            assert FAKE_KEY not in f.read_bytes().decode("utf-8", "replace")
+
+    def test_meta_stores_redacted_url(self, monkeypatch):
+        monkeypatch.setattr(steam_cli._CACHE, "enabled", True)
+        url = f"https://api.steampowered.com/x/?key={FAKE_KEY}&appid=1"
+        monkeypatch.setattr(steam_cli, "_http_get_network",
+                            lambda *a, **k: b"{}")
+        steam_cli.http_get(url, cache_ttl=600)
+        meta = next(p for p in pathlib.Path(steam_cli._CACHE.dir).iterdir()
+                    if p.suffix == ".meta")
+        assert json.loads(meta.read_text())["url"].endswith("key=REDACTED&appid=1")
+
+    def test_two_keys_do_not_share_a_cache_entry(self):
+        # Different publisher keys legitimately get different data from the same
+        # URL (each sees its own portfolio), so they must not collide...
+        a = steam_cli._cache_paths(f"https://x/?key={FAKE_KEY}")
+        b = steam_cli._cache_paths(f"https://x/?key={OTHER_KEY}")
+        assert a != b
+        # ...while neither key appears in the resulting filenames.
+        assert FAKE_KEY not in a[0] and OTHER_KEY not in b[0]
+
+    def test_keyless_urls_hash_unchanged(self):
+        # Upgrading must not orphan an existing cache built before this change.
+        url = "https://store.steampowered.com/api/appdetails?appids=1"
+        expected = hashlib.sha256(url.encode()).hexdigest()
+        assert steam_cli._cache_paths(url)[0].endswith(expected + ".body")
+
+    def test_http_error_message_redacts_key(self, monkeypatch):
+        url = f"https://api.steampowered.com/x/?key={FAKE_KEY}"
+
+        def boom(*a, **k):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+
+        monkeypatch.setattr(steam_cli, "_get_urllib", boom)
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli._http_get_network(url, 5.0, False)
+        assert FAKE_KEY not in str(ei.value)
+        assert "key=REDACTED" in str(ei.value)
+
+    def test_curl_error_stderr_redacts_key(self, monkeypatch):
+        # curl echoes the URL in its own messages, so its stderr is redacted too.
+        url = f"https://api.steampowered.com/x/?key={FAKE_KEY}"
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run",
+                            lambda *a, **k: SimpleNamespace(
+                                returncode=7, stdout=b"",
+                                stderr=f"curl: (7) failed to connect to {url}".encode()))
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli._get_curl(url, 5.0, False)
+        assert FAKE_KEY not in str(ei.value)
+
+    def test_curl_keeps_url_out_of_argv(self, monkeypatch):
+        # `ps` is world-readable: a key in argv would be visible to every user.
+        seen = {}
+        url = f"https://api.steampowered.com/x/?key={FAKE_KEY}"
+        monkeypatch.setattr(steam_cli.shutil, "which", lambda _: "/usr/bin/curl")
+        monkeypatch.setattr(steam_cli.subprocess, "run",
+                            lambda cmd, **kw: seen.update(cmd=cmd, input=kw.get("input"))
+                            or SimpleNamespace(returncode=0, stdout=b"ok", stderr=b""))
+        steam_cli._get_curl(url, 5.0, False)
+        assert not any(FAKE_KEY in part for part in seen["cmd"])
+        assert FAKE_KEY.encode() in seen["input"]
+
+    def test_no_api_key_flag_exists(self):
+        # Deliberately absent: a key in argv leaks through `ps` and shell history.
+        with pytest.raises(SystemExit):
+            make_args(["auth", "--api-key", FAKE_KEY])
+
+    def test_unexpected_exception_envelope_redacts(self, monkeypatch, capsys):
+        # The last-resort contract guard also carries URLs sometimes.
+        def blow(args):
+            raise RuntimeError(f"boom https://x/?key={FAKE_KEY}")
+
+        monkeypatch.setattr(steam_cli, "cmd_cache", blow)
+        rc = steam_cli.main(["cache", "--json"])
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert FAKE_KEY not in out
+        assert json.loads(out)["code"] == "internal"
+
+
+class TestAuthCommand:
+    def test_set_reads_key_from_stdin_and_masks_it(self, monkeypatch, capsys):
+        monkeypatch.setattr(steam_cli.sys, "stdin", io.StringIO(FAKE_KEY + "\n"))
+        steam_cli.cmd_auth(make_args(["auth", "--set", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["saved"] is True
+        assert FAKE_KEY not in json.dumps(obj)
+        assert obj["key"].endswith(FAKE_KEY[-4:])
+
+    def test_set_writes_owner_only_permissions(self, monkeypatch):
+        monkeypatch.setattr(steam_cli.sys, "stdin", io.StringIO(FAKE_KEY + "\n"))
+        steam_cli.cmd_auth(make_args(["auth", "--set"]))
+        mode = os.stat(steam_cli._config_path()).st_mode & 0o777
+        assert mode == 0o600
+
+    def test_set_rejects_a_malformed_key(self, monkeypatch):
+        monkeypatch.setattr(steam_cli.sys, "stdin", io.StringIO("not-a-key\n"))
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_auth(make_args(["auth", "--set"]))
+        assert ei.value.code == "invalid"
+        assert not os.path.exists(steam_cli._config_path())
+
+    def test_status_never_prints_the_whole_key(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        steam_cli.cmd_auth(make_args(["auth"]))
+        out = capsys.readouterr().out
+        assert FAKE_KEY not in out
+        assert FAKE_KEY[-4:] in out
+
+    def test_status_reports_source(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        steam_cli.cmd_auth(make_args(["auth", "--json"]))
+        assert json.loads(capsys.readouterr().out)["source"] == \
+            f"env:{steam_cli.API_KEY_ENV}"
+
+    def test_status_without_key_is_not_an_error(self, capsys):
+        rc = steam_cli.cmd_auth(make_args(["auth", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert rc == 0 and obj["configured"] is False and obj["key"] is None
+
+    def test_status_warns_on_world_readable_config(self, capsys):
+        steam_cli._write_config({"api_key": FAKE_KEY})
+        os.chmod(steam_cli._config_path(), 0o644)
+        steam_cli.cmd_auth(make_args(["auth", "--json"]))
+        assert "readable by other users" in \
+            json.loads(capsys.readouterr().out)["warning"]
+
+    def test_clear_removes_the_key(self, capsys):
+        steam_cli._write_config({"api_key": FAKE_KEY})
+        steam_cli.cmd_auth(make_args(["auth", "--clear", "--json"]))
+        assert json.loads(capsys.readouterr().out)["cleared"] is True
+        assert steam_cli.api_key() is None
+
+    def test_path_prints_config_location(self, capsys):
+        steam_cli.cmd_auth(make_args(["auth", "--path", "--json"]))
+        assert json.loads(capsys.readouterr().out)["path"] == steam_cli._config_path()
+
+
+# ----- partner financials: wishlists & sales -------------------------------
+# Fixture numbers are synthetic on purpose: real wishlist/revenue figures are
+# the owner's commercial data and fixtures live in a public repository.
+
+class TestFinancialDates:
+    def test_defaults_to_yesterday_not_today(self, monkeypatch):
+        # Today's numbers are partial; reporting them as a full day misleads.
+        monkeypatch.setattr(steam_cli, "_tz_today",
+                            lambda tz: datetime.date(2026, 7, 15))
+        assert steam_cli._financial_dates(None, 1, "gmt") == ["2026-07-14"]
+
+    def test_days_window_ends_at_date_and_is_ascending(self):
+        assert steam_cli._financial_dates("2026-07-10", 3, "gmt") == \
+            ["2026-07-08", "2026-07-09", "2026-07-10"]
+
+    def test_rejects_malformed_date(self):
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli._financial_dates("10.07.2026", 1, "gmt")
+        assert ei.value.code == "invalid"
+
+    def test_days_capped(self):
+        # Guard on the fan-out: one HTTP request per day, and Valve restricts
+        # keys that re-query settled dates too hard.
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli._financial_dates(None, 500, "gmt")
+        assert ei.value.code == "invalid"
+
+    def test_days_below_one_rejected(self):
+        with pytest.raises(steam_cli.SteamError):
+            steam_cli._financial_dates(None, 0, "gmt")
+
+    def test_settled_day_cached_hard_today_cached_briefly(self, monkeypatch):
+        monkeypatch.setattr(steam_cli, "_tz_today",
+                            lambda tz: datetime.date(2026, 7, 15))
+        assert steam_cli._financials_ttl("2026-07-01", "gmt") == steam_cli._SETTLED_TTL
+        assert steam_cli._financials_ttl("2026-07-15", "gmt") == steam_cli._TODAY_TTL
+
+
+class TestWishlistCommand:
+    def test_reports_summary_and_countries(self, monkeypatch, capsys, fixture):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json",
+                            lambda *a, **k: fixture("wishlist_reporting.json"))
+        steam_cli.cmd_wishlist(make_args(
+            ["wishlist", "123456", "--date", "2020-01-15", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["total"] == {"adds": 40, "deletes": 6, "purchases": 9,
+                                "gifts": 1, "net_adds": 34}
+        assert obj["days"][0]["countries"][0]["cc"] == "US"
+        assert obj["data_since"] == "2019-03-01"
+
+    def test_os_breakdown_kept_separate_from_total(self, monkeypatch, capsys,
+                                                   fixture):
+        # 11+3+0 != 55: Steam attributes only some adds to an OS, so the
+        # breakdown must not read as a complete split of `adds`.
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json",
+                            lambda *a, **k: fixture("wishlist_reporting.json"))
+        steam_cli.cmd_wishlist(make_args(
+            ["wishlist", "123456", "--date", "2020-01-15", "--json"]))
+        day = json.loads(capsys.readouterr().out)["days"][0]
+        assert day["adds_by_os"] == {"windows": 8, "mac": 2, "linux": 1}
+        assert sum(day["adds_by_os"].values()) != day["adds"]
+
+    def test_aggregates_multiple_days(self, monkeypatch, capsys, fixture):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json",
+                            lambda *a, **k: fixture("wishlist_reporting.json"))
+        steam_cli.cmd_wishlist(make_args(
+            ["wishlist", "123456", "--date", "2020-01-15", "--days", "3",
+             "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert len(obj["days"]) == 3
+        assert obj["total"]["adds"] == 40 * 3
+
+    def test_requires_a_key(self, capsys):
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_wishlist(make_args(["wishlist", "123456", "--json"]))
+        assert ei.value.code == "auth"
+
+    def test_uses_gmt_and_hits_the_partner_host(self, monkeypatch, capsys, fixture):
+        seen = {}
+
+        def spy(url, params=None, **kw):
+            seen["url"] = url
+            seen["params"] = params
+            return fixture("wishlist_reporting.json")
+
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", spy)
+        steam_cli.cmd_wishlist(make_args(
+            ["wishlist", "123456", "--date", "2020-01-15", "--json"]))
+        assert seen["url"].startswith(steam_cli.PARTNER_API)
+        assert "GetAppWishlistReporting" in seen["url"]
+        assert seen["params"]["date"] == "2020-01-15"
+
+
+class TestSalesCommand:
+    def test_empty_response_reads_as_missing_permission_not_zero_sales(
+            self, monkeypatch):
+        # The whole point: {"response": {}} means the key lacks Sales Data.
+        # Reporting it as "0 revenue" would be a lie the owner might act on.
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: {"response": {}})
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_sales(make_args(["sales", "--date", "2026-07-10"]))
+        assert ei.value.code == "auth"
+        assert "Sales Data" in str(ei.value)
+
+    def test_string_numbers_normalised(self, monkeypatch, capsys):
+        # Steam sends money as strings ("9.9900").
+        payload = {"response": {
+            "detailed_sales": [{"packageid": 7, "platform": "windows",
+                                "country_code": "US", "gross_units_sold": "3",
+                                "gross_sales_usd": "29.9700",
+                                "net_sales_usd": "20.9790"}],
+            "package_info": [{"packageid": 7, "package_name": "Game",
+                              "appid": 123456}],
+            "app_info": [{"appid": 123456, "app_name": "My Game"}]}}
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: payload)
+        steam_cli.cmd_sales(make_args(["sales", "--date", "2020-01-15", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["total"] == {"units": 3, "gross_usd": 29.97, "net_usd": 20.98}
+        assert obj["days"][0]["rows"][0]["game"] == "My Game"
+
+    def test_filters_to_one_game_client_side(self, monkeypatch, capsys):
+        # GetDetailedSales has no appid parameter — it returns the whole account.
+        payload = {"response": {
+            "detailed_sales": [
+                {"packageid": 7, "country_code": "US", "gross_units_sold": "3",
+                 "gross_sales_usd": "30", "net_sales_usd": "21"},
+                {"packageid": 8, "country_code": "US", "gross_units_sold": "5",
+                 "gross_sales_usd": "50", "net_sales_usd": "35"}],
+            "package_info": [{"packageid": 7, "appid": 111},
+                             {"packageid": 8, "appid": 222}],
+            "app_info": [{"appid": 111, "app_name": "A"},
+                         {"appid": 222, "app_name": "B"}]}}
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: payload)
+        steam_cli.cmd_sales(make_args(
+            ["sales", "--game", "111", "--date", "2020-01-15", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["total"]["units"] == 3
+        assert {r["appid"] for r in obj["days"][0]["rows"]} == {111}
+
+    def test_uses_pacific_not_gmt(self, monkeypatch):
+        # Neighbouring methods disagree on timezone; sales is Pacific.
+        seen = {}
+
+        def spy(tz):
+            seen["tz"] = tz
+            return datetime.date(2026, 7, 15)
+
+        monkeypatch.setattr(steam_cli, "_tz_today", spy)
+        steam_cli._financial_dates(None, 1, "pacific")
+        assert seen["tz"] == "pacific"
+
+    def test_requires_a_key(self):
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_sales(make_args(["sales"]))
+        assert ei.value.code == "auth"
+
+
+class TestFinancialsRegressions:
+    """Each test here pins a bug found in review — see the failure it prevents."""
+
+    def test_empty_wishlist_response_is_auth_error_not_zero(self, monkeypatch):
+        # Was: an unpermitted key produced a confident "0 wishlist adds".
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: {"response": {}})
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_wishlist(make_args(
+                ["wishlist", "123456", "--date", "2020-01-15"]))
+        assert ei.value.code == "auth"
+
+    def test_unresolvable_package_excluded_from_single_game_report(
+            self, monkeypatch, capsys):
+        # Was: a row whose package didn't map to an app was KEPT, so another
+        # product's revenue inflated a --game report (repro: 17x).
+        payload = {"response": {
+            "detailed_sales": [
+                {"packageid": 7, "country_code": "US", "gross_units_sold": "3",
+                 "gross_sales_usd": "30", "net_sales_usd": "21"},
+                {"packageid": 999, "country_code": "US", "gross_units_sold": "50",
+                 "gross_sales_usd": "500", "net_sales_usd": "350"}],
+            "package_info": [{"packageid": 7, "appid": 111}],
+            "app_info": [{"appid": 111, "app_name": "A"}]}}
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: payload)
+        steam_cli.cmd_sales(make_args(
+            ["sales", "--game", "111", "--date", "2020-01-15", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["total"]["units"] == 3
+        assert obj["total"]["gross_usd"] == 30.0
+        assert obj["unresolved_rows"] == 1     # reported, not silently dropped
+
+    def test_partial_days_are_reported_not_silently_dropped(self, monkeypatch,
+                                                            capsys):
+        # Was: a day Steam didn't answer vanished, and the total over the
+        # surviving days looked like a genuine slow week.
+        full = {"response": {
+            "detailed_sales": [{"packageid": 7, "country_code": "US",
+                                "gross_units_sold": "2", "gross_sales_usd": "20",
+                                "net_sales_usd": "14"}],
+            "package_info": [{"packageid": 7, "appid": 111}],
+            "app_info": [{"appid": 111, "app_name": "A"}]}}
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(1)
+            return full if len(calls) == 1 else {"response": {}}
+
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", flaky)
+        steam_cli.cmd_sales(make_args(
+            ["sales", "--date", "2020-01-17", "--days", "3", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert len(obj["missing_dates"]) == 2
+        assert len(obj["days"]) == 1
+
+    def test_config_dir_permissions_tightened_when_preexisting(self):
+        # Was: makedirs(mode=…) silently no-ops on an existing directory, so a
+        # pre-existing world-listable dir was never tightened.
+        parent = os.path.dirname(steam_cli._config_path())
+        os.makedirs(parent, exist_ok=True)
+        os.chmod(parent, 0o755)
+        steam_cli._write_config({"api_key": FAKE_KEY})
+        assert os.stat(parent).st_mode & 0o777 == 0o700
+
+    def test_app_min_date_survives_a_day_missing_it(self, monkeypatch, capsys):
+        # Was: taking the LAST day's value clobbered a good earlier one.
+        pages = [
+            {"response": {"wishlist_summary": {"wishlist_adds": 1},
+                          "app_min_date": "2019-03-01"}},
+            {"response": {"wishlist_summary": {"wishlist_adds": 1}}},
+        ]
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: pages.pop(0))
+        steam_cli.cmd_wishlist(make_args(
+            ["wishlist", "123456", "--date", "2020-01-15", "--days", "2",
+             "--json"]))
+        assert json.loads(capsys.readouterr().out)["data_since"] == "2019-03-01"
+
+    def test_fixture_carries_no_real_owner_data(self):
+        # The whole task exists to keep the owner's commercial numbers out of a
+        # public repo; a fixture is the easiest place to leak them by accident.
+        raw = (pathlib.Path(__file__).parent / "fixtures"
+               / "wishlist_reporting.json").read_text()
+        assert "1571990" not in raw          # the owner's real appid
+        assert '"date": "2026-' not in raw   # a real reporting date
+
+    def test_interactive_set_hides_the_key_from_the_terminal(self, monkeypatch,
+                                                             capsys):
+        # The path a human at a terminal actually uses: getpass keeps the key
+        # off the screen (and out of scrollback / tmux capture), where a plain
+        # readline would echo it.
+        monkeypatch.setattr(steam_cli.sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(steam_cli.getpass, "getpass", lambda _: FAKE_KEY)
+
+        def must_not_run():
+            raise AssertionError("readline must not be used on the tty path")
+
+        monkeypatch.setattr(steam_cli.sys.stdin, "readline", must_not_run)
+        steam_cli.cmd_auth(make_args(["auth", "--set", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["saved"] is True
+        assert FAKE_KEY not in json.dumps(obj)
+        assert steam_cli.api_key() == FAKE_KEY
+
+
+class TestMyGames:
+    # Synthetic app names on purpose: a real portfolio can include UNANNOUNCED
+    # titles, and fixtures live in a public repo.
+    PAYLOAD = {"applist": {"apps": {"app": [
+        {"appid": 111, "app_type": "game", "app_name": "Placeholder Game"},
+        {"appid": 112, "app_type": "demo", "app_name": "Placeholder Demo"},
+        {"appid": 113, "app_type": "game", "app_name": "Another Placeholder"},
+    ]}}}
+
+    def test_groups_by_type(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: self.PAYLOAD)
+        steam_cli.cmd_mygames(make_args(["mygames", "--json"]))
+        obj = json.loads(capsys.readouterr().out)
+        assert obj["count"] == 3
+        assert obj["by_type"] == {"game": 2, "demo": 1}
+
+    def test_type_filter_is_passed_to_steam(self, monkeypatch, capsys):
+        seen = {}
+
+        def spy(url, params=None, **kw):
+            seen["params"] = params
+            return self.PAYLOAD
+
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", spy)
+        steam_cli.cmd_mygames(make_args(["mygames", "--type", "game", "--json"]))
+        assert seen["params"]["type_filter"] == "game"
+
+    def test_empty_account_is_not_an_error(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: {})
+        rc = steam_cli.cmd_mygames(make_args(["mygames", "--json"]))
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["count"] == 0
+
+    def test_requires_a_key(self):
+        with pytest.raises(steam_cli.SteamError) as ei:
+            steam_cli.cmd_mygames(make_args(["mygames"]))
+        assert ei.value.code == "auth"
+
+    def test_text_render_groups_by_type(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: self.PAYLOAD)
+        steam_cli.cmd_mygames(make_args(["mygames"]))
+        out = capsys.readouterr().out
+        assert "3 app(s)" in out
+        assert "game (2)" in out and "demo (1)" in out
+        assert "111        Placeholder Game" in out
+
+    def test_text_render_on_empty_account(self, monkeypatch, capsys):
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: {})
+        steam_cli.cmd_mygames(make_args(["mygames"]))
+        assert "no apps on this key's account" in capsys.readouterr().out
+
+    def test_text_render_survives_a_nameless_app(self, monkeypatch, capsys):
+        # A malformed entry must not crash the listing with a TypeError.
+        monkeypatch.setenv(steam_cli.API_KEY_ENV, FAKE_KEY)
+        monkeypatch.setattr(steam_cli, "http_json", lambda *a, **k: {
+            "applist": {"apps": {"app": [{"appid": 9, "app_type": "game"}]}}})
+        steam_cli.cmd_mygames(make_args(["mygames"]))
+        assert "9" in capsys.readouterr().out
+
+    def test_error_message_only_points_at_real_commands(self):
+        # The wishlist auth error references `steam-cli mygames` — that command
+        # must actually exist, or the hint sends the user into an argparse error.
+        parser = steam_cli.build_parser()
+        choices = parser._subparsers._group_actions[0].choices
+        assert "mygames" in choices

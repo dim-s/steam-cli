@@ -16,9 +16,10 @@ sizing, similar games, review history, rough sales estimates).
 - **Always pass `--json` when you'll parse the result.** Every subcommand
   supports it and returns structured data; the default output is for humans.
 - **Errors are machine-readable.** On failure the command prints
-  `{"error": "<msg>", "code": "<not_found|http|network|parse|invalid>"}` to
+  `{"error": "<msg>", "code": "<not_found|http|network|parse|invalid|auth>"}` to
   **stdout** and exits non-zero — a parse always yields a JSON object, never an
-  empty stream.
+  empty stream. `auth` = a publisher-key command ran without a key, or the key
+  lacks the permission that call needs.
 - **`<game>` is an appid (`1145360`) or a name (`"Hades"`).** A name resolves
   to the top store hit (printed to **stderr**, so `--json` stdout stays clean).
   The top hit isn't always right (`"Hades"` → *Hades II*) — pass an appid or
@@ -44,6 +45,26 @@ steam-cli price "<game>" --cc us,de,ru --json   # compare regional pricing
 steam-cli images "<game>" --json                # download art, then open it to *see* the game
 ```
 
+### If the owner ships games on Steam (optional publisher key)
+
+Key-free stays the default; these commands are additive and only report on games
+the key's own account ships. Without a key they fail with `code: "auth"`.
+
+```bash
+steam-cli auth --json                           # is a key configured, and from where
+steam-cli mygames --json                        # which apps are on this account (+ their appids)
+steam-cli wishlist "<my game>" --days 30 --json # adds/deletes/purchases by day, country, OS
+steam-cli sales --days 7 --json                 # units + gross/net USD across the account
+```
+
+`mygames` lists **unreleased and unannounced** apps too — don't repeat that list
+into a commit message, an issue, a public doc or a test fixture.
+
+Set the key via `STEAM_CLI_API_KEY` or `steam-cli auth --set` (reads **stdin**).
+There is no `--api-key` flag on purpose — argv is visible via `ps` and sticks in
+shell history. **Never echo the owner's key, write it to a file, or paste it
+into a command line.**
+
 A fuller command reference and JSON shapes are in [`skill/SKILL.md`](./skill/SKILL.md).
 
 ## Don't
@@ -52,8 +73,16 @@ A fuller command reference and JSON shapes are in [`skill/SKILL.md`](./skill/SKI
 - Don't trust the auto-resolved appid for sequels without checking `search`.
 - Don't try to read a user's owned games / private profile / per-user
   achievements — those need a Steam Web API key and aren't supported.
-- Don't fabricate wishlists/followers or concurrent-player history — they
-  aren't reachable key-free; `history` (review velocity) is the closest proxy.
+- Don't fabricate wishlists, followers or concurrent-player history. For a game
+  the owner **doesn't** ship, none of these are reachable — `history` (review
+  velocity) is the closest proxy. For the owner's **own** games, wishlists are
+  real data: use `wishlist` (needs a publisher key), don't estimate them.
+- Don't report an empty `sales` response as "zero sales" — it means the key
+  lacks the Sales Data permission. The CLI already says so; pass that on.
+- Don't conclude a Steam endpoint doesn't exist from
+  `ISteamWebAPIUtil/GetSupportedAPIList`. It is a shop window, not a registry —
+  `IPartnerFinancialsService` is missing from it entirely, and other interfaces
+  list a fraction of their methods. Check partner.steamgames.com/doc/webapi.
 
 ## Task board (boardown) — keep it current proactively
 

@@ -1,6 +1,6 @@
 ---
 name: steam
-description: Query the public Steam API (no key) via the `steam-cli` command — reviews & sentiment, store info (genres/release/devs/price/metacritic), live player counts, news/patch notes, achievement stats, screenshots/art, sales & top-sellers, public player profiles, plus market recon: user tags, niche browse by tag/price, similar games, review-velocity history, rough sales estimates. Use whenever a task needs real Steam data on a game, its reception, or its niche/competitors. English triggers — "Steam reviews/rating/score of", "is <game> good on Steam", "Steam store info/genres/release/price of", "players online now", "patch notes/news for", "achievement %", "find the appid", "overview of <game>", "screenshots/art of", "what's on sale / top sellers", "Steam profile of / who wrote this review", "user tags of <game>", "find cozy/roguelike games / how big is the niche", "browse Steam by tag", "games similar to <game>", "how many copies did <game> sell / owners / revenue", "did its launch hold up / review history". Russian triggers — «отзывы/рейтинг/оценка в стиме», «инфа/жанр/дата/цена игры», «онлайн игроков сейчас», «патчноут/новости», «проценты ачивок», «найди appid», «обзор игры», «скриншоты/арт», «распродажа/топ продаж», «профиль игрока/кто написал отзыв», «теги игры», «найди cozy/роглайк, размер ниши», «полистай стим по тегу», «похожие игры на», «сколько копий продала/владельцев/выручка», «удержался ли лонч/история отзывов». Also use proactively for analyzing a game's reception or competitor/niche research on Steam. Public Steam Community profiles ARE supported (key-free). Do NOT use for non-Steam stores (Epic/GOG/mobile), a user's owned-games library / private profiles / per-user achievements (need a Web API key), or buying/wishlisting.
+description: Real Steam data via the `steam-cli` command, no API key needed — reviews and sentiment, store info (genres, release, devs, price, metacritic), live player counts, news and patch notes, achievement stats, screenshots and art, current specials and top sellers, public player profiles, plus market recon: user tags, niche sizing by tag and price, similar games, review-velocity history, rough sales estimates. Use for any question about a Steam game, its reception, its niche or its competitors — "is <game> good on Steam", "how many copies did it sell", "players online now", "what's it tagged as", "games like X", "how big is the cozy/roguelike niche", "find the appid", "who wrote this review", "did its launch hold up". Russian — «отзывы/оценка в стиме», «жанр/дата/цена игры», «онлайн игроков», «патчноут», «ачивки», «найди appid», «теги игры», «похожие игры», «размер ниши», «сколько копий продала», «профиль игрока». ALSO, when the user SHIPS games on Steam and has set a publisher API key — wishlist reporting, sales and revenue, and the app portfolio for THEIR OWN games: "my wishlists", "how many wishlists did I get", "my sales / revenue", «мои вишлисты», «мои продажи/выручка», «статистика по моей игре». Do NOT use for non-Steam stores (Epic/GOG/mobile), another player's library or private profile, wishlist counts for a game the user does NOT ship (impossible at any permission level), page traffic or impressions (Steamworks web UI only), or buying/wishlisting.
 ---
 
 # steam — query the public Steam API
@@ -29,7 +29,9 @@ resolution note.
 `{"error": "<message>", "code": "<slug>"}` to **stdout** (not stderr) and
 exits non-zero — so a parse of the output always yields a JSON object, never
 an empty stream. `code` is one of `not_found` / `http` / `network` / `parse` /
-`invalid` (a bad `--lang`/`--cc` value).
+`invalid` (a bad `--lang`/`--cc` value) / `auth` (a key-only command was run
+without a publisher key, or the key lacks the needed permission — the message
+says which).
 
 **Reliability flags (all subcommands):** transient failures (HTTP 429/5xx,
 flaky network) are retried automatically with backoff, so a single blip won't
@@ -79,6 +81,16 @@ freshness). Manage it with `steam-cli cache` (show size/path), `cache --path`,
 | `steam-cli profile <id>` | **Public** Steam Community profile (steamID64 / vanity); pairs with a reviewer's `author.steamid` |
 | `steam-cli cache [--path\|--clear]` | Inspect or clear the on-disk cache |
 
+**Publisher-key commands** — only for games the key's account ships. Without a
+key they fail with `code: "auth"` and a message saying how to set one up:
+
+| Command | Use it for |
+|---|---|
+| `steam-cli auth [--set\|--clear\|--path]` | Configure the optional publisher key (`--set` reads it from **stdin**) |
+| `steam-cli mygames [--type game]` | **Every app your key's account ships**, grouped by type (game / demo / dlc / music / beta) |
+| `steam-cli wishlist <game>` | **Wishlist reporting for YOUR game** — adds / deletes / purchases / gifts per day, by country, by language, by OS |
+| `steam-cli sales` | **Units and revenue for YOUR games** — gross/net USD by package, platform, country |
+
 ## JSON output shapes
 
 What each command returns under `--json`, so you can parse without guessing.
@@ -104,6 +116,10 @@ object; only `overview`, `reviews`, `price`, `images`, `players` carry the
 | `history` | `{appid, summary:{buckets, rollup_type, window, overall, launch, tail, recent_30d, peak}, rollups:[{date, recommendations_up, recommendations_down}], recent_30d:[…]}` — each agg is `{up, down, total, pct_positive}`; `date` is epoch seconds |
 | `overview --estimate` | adds `sales_estimate:{method, data, total_reviews, owners:{conservative,mid,optimistic:{multiplier,owners}}, revenue_usd, price_usd}` — `revenue_usd` null for free/unknown-price; **rough order-of-magnitude, not a Steam figure** |
 | `profile` | `{steamid64, name, private, privacy_state, online_state, state_message, member_since, location, real_name, summary, vac_banned, avatar, profile_url}` — non-`public` profiles set `private:true` and null the hidden fields |
+| `wishlist` | `{appid, days:[{date, adds, deletes, purchases, gifts, adds_by_os:{windows,mac,linux}, countries:[{cc, country, region, adds, deletes, purchases, gifts}], languages:[…]}], total:{adds, deletes, purchases, gifts, net_adds}, data_since}` — **`adds_by_os` does NOT sum to `adds`**: Steam attributes only some adds to an OS |
+| `sales` | `{appid, days:[{date, units, gross_usd, net_usd, rows:[{packageid, package, appid, game, platform, cc, units, gross_usd, net_usd}]}], total:{units, gross_usd, net_usd}}` — `net_usd` is after Steam's share and refunds; money arrives from Steam as strings and is normalised to numbers here |
+| `mygames` | `{count, by_type:{game, demo, dlc, music, beta}, apps:[{appid, name, type}]}` — includes UNRELEASED and unannounced entries, so treat the list as confidential |
+| `auth` (no flags) | `{configured, source, key, config_path, warning}` — `key` is masked (`····8871`), never the real value |
 
 ## `images` — see the game, don't just read about it
 
@@ -205,6 +221,63 @@ the error bars are large; use it for order-of-magnitude, never precision.
 > historical concurrent-player / price curves. These live only in SteamDB or
 > the Steamworks partner backend. `history` (review velocity) is the nearest
 > public proxy for pre-launch/retention momentum.
+
+## Your own games — the optional publisher key
+
+Everything else in this skill is key-free and works for **any** game. This
+section is different: it reports on games the key's Steam account **ships**.
+
+```bash
+# Is a key configured, and where did it come from? (never prints the key)
+steam-cli auth --json
+
+# Which games are on this key's account? (start here — gives you the appids)
+steam-cli mygames --json
+steam-cli mygames --type game --json
+
+# Wishlist numbers for your game — yesterday by default (today is partial)
+steam-cli wishlist "My Game" --json
+steam-cli wishlist "My Game" --days 30 --json     # a month, aggregated + per day
+steam-cli wishlist <your-appid> --date 2026-07-10 --json
+
+# Units and revenue across your whole account, or one game
+steam-cli sales --days 7 --json
+steam-cli sales --game <your-appid> --date 2026-07-10 --json
+```
+
+**Setting the key** — environment `STEAM_CLI_API_KEY` (or `STEAM_API_KEY`), or
+`steam-cli auth --set`, which reads it from **stdin** and stores it `0600`.
+There is deliberately **no `--api-key` flag**: an argument is visible to other
+users via `ps` and lands in shell history. Never echo a user's key back to
+them, never write it into a file you create, and never put it in a command
+line.
+
+**Two permission traps, both cost real time:**
+
+1. `wishlist` needs only a normal publisher key. **`sales` additionally needs a
+   Financial API Group with the "Sales Data" permission** (Steamworks → Users &
+   Permissions → Manage Groups). This is *not* the "Financial" checkbox on the
+   key itself — that one only covers `ISteamMicroTxn` (in-game purchases).
+2. When the permission is missing, Steam returns an empty response rather than
+   an error. `steam-cli` translates that into `code: "auth"` with an
+   explanation — **do not report it to the user as "zero sales"**, it means
+   "no permission".
+
+**Timezones differ between the two reports** and steam-cli passes `--date`
+through as given: wishlist reporting is **GMT**, detailed sales is **US
+Pacific**. A day-level comparison of the two is off by up to 8 hours.
+
+**What no key can give you** — save the user the search:
+
+- wishlist counts for a game they don't own (does not exist at any level);
+- page traffic / impressions / UTM stats (Steamworks web UI only, no API);
+- another player's library or private profile.
+
+**When hunting for a Steam endpoint, don't trust
+`ISteamWebAPIUtil/GetSupportedAPIList`.** It is a shop window, not a registry:
+`IPartnerFinancialsService` (wishlists and sales) is absent from it entirely,
+and other interfaces list a fraction of their real methods. Check the
+[partner docs](https://partner.steamgames.com/doc/webapi) instead.
 
 ## `reviews` — the main tool
 

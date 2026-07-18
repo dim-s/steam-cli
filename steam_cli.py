@@ -7,6 +7,7 @@
 
 Subcommands: overview, reviews, info, search, players, news, achievements,
 price, images, specials, top-sellers, profile, tags, browse, similar, history.
+With an optional publisher API key: auth, wishlist, sales.
 Stdlib only. Transparently falls back from urllib to `curl` when the host
 intercepts TLS (corporate proxies, dev machines with a custom root CA).
 """
@@ -16,6 +17,8 @@ import argparse
 import calendar
 import concurrent.futures
 import csv
+import datetime as dt
+import getpass
 import hashlib
 import html
 import json
@@ -33,11 +36,15 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 STORE = "https://store.steampowered.com"
 API = "https://api.steampowered.com"
 COMMUNITY = "https://steamcommunity.com"
+# Partner-only endpoints answer on their own host. (The publisher key also works
+# against api.steampowered.com for most interfaces, but Valve documents the
+# financials service on this one.)
+PARTNER_API = "https://partner.steam-api.com"
 USER_AGENT = f"steam-cli/{__version__} (+https://github.com/dim-s/steam-cli)"
 
 
@@ -183,6 +190,81 @@ def normalize_country(value: str | None) -> str | None:
         code="invalid")
 
 
+# ----- publisher API key ---------------------------------------------------
+# steam-cli stays key-free by default: every command that worked without a key
+# still does. A Steam *publisher* Web API key is strictly additive — it unlocks
+# extra data about the games the key's own account ships (achievement schema
+# including hidden ones, the app portfolio, builds/branches).
+#
+# The key is a secret, so it is never accepted as a command-line argument:
+# argv is world-readable via `ps` and lands in shell history. It arrives either
+# through the environment or from a 0600 config file written by `auth --set`,
+# which reads it off stdin.
+
+API_KEY_ENV = "STEAM_CLI_API_KEY"
+# Also honoured because it is the de-facto name across Steam tooling, so an
+# agent or a CI job is likely to export it without reading our docs first.
+API_KEY_ENV_ALIAS = "STEAM_API_KEY"
+
+_KEY_RE = re.compile(r"^[0-9A-Fa-f]{32}$")
+# Matches the key in a query string so it can be stripped before a URL is ever
+# written to disk, embedded in an error message, or hashed into a cache name.
+_KEY_IN_URL_RE = re.compile(r"([?&]key=)[^&]*")
+
+
+def _redact(text: str) -> str:
+    """Strip publisher-key values out of anything user- or disk-facing.
+
+    Applied to every path where a URL becomes text: cache metadata, cache
+    filenames, and all three error messages that interpolate a URL. Kept as one
+    function so a new URL-carrying message can't quietly reintroduce the leak.
+    """
+    return _KEY_IN_URL_RE.sub(r"\1REDACTED", text)
+
+
+def _config_path() -> str:
+    env = os.environ.get("STEAM_CLI_CONFIG")
+    if env:
+        return env
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+        return os.path.join(base, "steam-cli", "config.json")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "steam-cli", "config.json")
+
+
+def _read_config() -> dict:
+    try:
+        with open(_config_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}   # missing/corrupt config behaves as "no key configured"
+
+
+def api_key(*, required_for: str | None = None) -> str | None:
+    """Resolve the key: environment first, then the config file.
+
+    With `required_for` set, a missing key raises instead of returning None, so
+    a key-only command fails with a machine-readable `auth` code rather than
+    firing a request Steam would reject.
+    """
+    key = (os.environ.get(API_KEY_ENV) or os.environ.get(API_KEY_ENV_ALIAS)
+           or _read_config().get("api_key") or "").strip()
+    if not key and required_for:
+        raise SteamError(
+            f"`{required_for}` needs a Steam publisher Web API key. "
+            f"Run `steam-cli auth --set`, or export {API_KEY_ENV}=<key>. "
+            "Get one at https://partner.steamgames.com (Users & Permissions → "
+            "Manage Web API Keys).", code="auth")
+    return key or None
+
+
+def mask_key(key: str) -> str:
+    """Show only enough to tell two keys apart; never the key itself."""
+    return f"{'·' * 28}{key[-4:]}" if len(key) >= 4 else "····"
+
+
 # ----- on-disk cache -------------------------------------------------------
 # A single cache layer keyed on the full URL sits in front of http_get, so it
 # serves both JSON responses and downloaded image bytes. TTL is chosen per
@@ -222,7 +304,18 @@ _CACHE = _CacheConfig()
 
 
 def _cache_paths(url: str) -> tuple[str, str]:
-    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    # Key-free URLs hash exactly as before, so upgrading doesn't orphan an
+    # existing cache. When a key IS present it must not reach the filename, yet
+    # two different publisher keys legitimately get different answers from the
+    # same URL (each sees its own app list) — so hash the redacted URL together
+    # with a digest of the key rather than the key itself.
+    m = re.search(r"[?&]key=([^&]*)", url)
+    if m:
+        salt = hashlib.sha256(m.group(1).encode("utf-8")).hexdigest()[:16]
+        basis = f"{_redact(url)}|{salt}"
+    else:
+        basis = url
+    h = hashlib.sha256(basis.encode("utf-8")).hexdigest()
     return os.path.join(_CACHE.dir, h + ".body"), os.path.join(_CACHE.dir, h + ".meta")
 
 
@@ -268,7 +361,7 @@ def _cache_put(url: str, body: bytes, ttl: float) -> None:
         # meta written last: a reader requires it, so a half-written body alone
         # reads as a miss rather than as valid data.
         _atomic_write(meta_path, json.dumps(
-            {"url": url, "fetched_at": time.time()}).encode("utf-8"))
+            {"url": _redact(url), "fetched_at": time.time()}).encode("utf-8"))
     except OSError:
         pass  # caching is best-effort; never fail the request over it
 
@@ -336,24 +429,36 @@ def _get_curl(url: str, timeout: float, insecure: bool,
     cmd = [curl, "-fsSL", "--max-time", max_time, "-A", USER_AGENT]
     if insecure:
         cmd.append("-k")
+    # The URL and cookie go through a config on stdin (-K -) rather than argv:
+    # a URL carrying `key=<publisher key>` would otherwise be readable by any
+    # other user on the machine via `ps`.
+    cmd += ["-K", "-"]
+    config = f'url = "{_curl_quote(url)}"\n'
     if cookie:
-        cmd += ["-b", cookie]
-    cmd.append(url)
+        config += f'cookie = "{_curl_quote(cookie)}"\n'
     # Force curl's own messages to the C locale so its exit-22 stderr carries the
     # stable English "returned error: NNN" phrasing that _curl_http_status keys
     # on — a localized curl would otherwise translate it and hide the status.
-    proc = subprocess.run(cmd, capture_output=True,
+    proc = subprocess.run(cmd, input=config.encode("utf-8"), capture_output=True,
                           env={**os.environ, "LC_ALL": "C"})
     if proc.returncode != 0:
-        err = proc.stderr.decode("utf-8", "replace").strip()
+        # curl echoes the requested URL in some messages, so redact its stderr
+        # too — not just the URL we interpolate ourselves.
+        err = _redact(proc.stderr.decode("utf-8", "replace").strip())
         if proc.returncode == 22:        # curl -f: server returned HTTP >= 400
             status = _curl_http_status(err)
             raise SteamError(
-                f"HTTP {status} for {url}" if status else (err or "curl HTTP error"),
+                f"HTTP {status} for {_redact(url)}" if status
+                else (err or "curl HTTP error"),
                 code="http", status=status)
         raise SteamError(f"HTTP request failed: {err or f'curl exit {proc.returncode}'}",
                          code="network")
     return proc.stdout
+
+
+def _curl_quote(value: str) -> str:
+    """Escape a value for curl's `-K` config syntax (double-quoted string)."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _curl_http_status(stderr: str) -> int | None:
@@ -418,7 +523,7 @@ def _http_get_network(url: str, timeout: float, insecure: bool,
                 last = e
                 time.sleep(2 ** attempt)
                 continue
-            raise SteamError(f"HTTP {e.code} for {url}", code="http") from e
+            raise SteamError(f"HTTP {e.code} for {_redact(url)}", code="http") from e
         except urllib.error.URLError as e:
             if _HTTP_MODE == "auto" and _is_tls_error(e) and shutil.which("curl"):
                 _curl_fallback = True  # remember for the rest of the run
@@ -426,13 +531,14 @@ def _http_get_network(url: str, timeout: float, insecure: bool,
             if _is_tls_error(e):
                 # TLS interception with no curl to fall back to — retrying
                 # the same handshake won't help.
-                raise SteamError(f"Network error: {e}", code="network") from e
+                raise SteamError(f"Network error: {_redact(str(e))}", code="network") from e
             if attempt < _MAX_RETRIES - 1:
                 last = e
                 time.sleep(2 ** attempt)
                 continue
-            raise SteamError(f"Network error: {e}", code="network") from e
-    raise SteamError(f"Network error: {last}", code="network")  # pragma: no cover
+            raise SteamError(f"Network error: {_redact(str(e))}", code="network") from e
+    raise SteamError(f"Network error: {_redact(str(last))}",
+                     code="network")  # pragma: no cover
 
 
 def _retry_get(getter, url: str) -> bytes:
@@ -451,13 +557,13 @@ def _retry_get(getter, url: str) -> bytes:
                 last = e
                 time.sleep(2 ** attempt)
                 continue
-            raise SteamError(f"HTTP {e.code} for {url}", code="http") from e
+            raise SteamError(f"HTTP {e.code} for {_redact(url)}", code="http") from e
         except urllib.error.URLError as e:
             if attempt < _MAX_RETRIES - 1:
                 last = e
                 time.sleep(2 ** attempt)
                 continue
-            raise SteamError(f"Network error: {e}", code="network") from e
+            raise SteamError(f"Network error: {_redact(str(e))}", code="network") from e
         except SteamError as e:
             # retry a transient HTTP (429/5xx) or any network error; a hard HTTP
             # (4xx) or a config error (no curl, code="error") raises straight out.
@@ -468,7 +574,8 @@ def _retry_get(getter, url: str) -> bytes:
                 time.sleep(2 ** attempt)
                 continue
             raise
-    raise SteamError(f"Network error: {last}", code="network")  # pragma: no cover
+    raise SteamError(f"Network error: {_redact(str(last))}",
+                     code="network")  # pragma: no cover
 
 
 def http_json(url: str, params: dict | None = None, *, timeout: float = 30.0,
@@ -1479,6 +1586,440 @@ def cmd_cache(args) -> int:
     return 0
 
 
+# ----- subcommand: auth ----------------------------------------------------
+
+def _write_config(cfg: dict) -> str:
+    """Persist the config with owner-only permissions, 0600 from the start.
+
+    The mode is set on the temp file *before* the key is written to it, so the
+    secret is never briefly readable by other users on the machine.
+    """
+    path = _config_path()
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    # makedirs ignores `mode` when the directory already exists, so a dir
+    # created earlier (or pointed at by STEAM_CLI_CONFIG) would keep its looser
+    # permissions. The file itself is 0600 either way, but a listable dir still
+    # leaks that a key is configured here.
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    tmp = f"{path}.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def cmd_auth(args) -> int:
+    if args.path:                        # script-friendly: just the file path
+        if args.json:
+            _emit_json({"path": _config_path()})
+        else:
+            print(_config_path())
+        return 0
+
+    if args.set:
+        # Read from stdin, never from argv: a key in a command line is visible
+        # to other users via `ps` and persists in shell history.
+        if sys.stdin.isatty():
+            # getpass keeps the key off the screen (and out of scrollback,
+            # tmux capture, screen recordings) as well as out of argv.
+            key = getpass.getpass("Paste your Steam publisher Web API key "
+                                  "(input stays hidden): ").strip()
+        else:
+            key = sys.stdin.readline().strip()
+        if not _KEY_RE.match(key):
+            raise SteamError(
+                "That doesn't look like a Steam Web API key (expected 32 "
+                "hexadecimal characters). Nothing was saved.", code="invalid")
+        cfg = _read_config()
+        cfg["api_key"] = key
+        path = _write_config(cfg)
+        if args.json:
+            _emit_json({"saved": True, "path": path, "key": mask_key(key)})
+        else:
+            print(f"key saved to {path} (mode 600): {mask_key(key)}")
+        return 0
+
+    if args.clear:
+        cfg = _read_config()
+        had = bool(cfg.pop("api_key", None))
+        path = _write_config(cfg) if cfg else _config_path()
+        if not cfg:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if args.json:
+            _emit_json({"cleared": had, "path": path})
+        else:
+            print(f"key removed from {path}" if had else "no key was configured")
+        return 0
+
+    # default: report where the key comes from, never what it is
+    env_name = next((n for n in (API_KEY_ENV, API_KEY_ENV_ALIAS)
+                     if os.environ.get(n)), None)
+    file_key = _read_config().get("api_key")
+    key = api_key()
+    source = f"env:{env_name}" if env_name else ("config" if file_key else None)
+    warn = None
+    if file_key and not env_name:
+        try:
+            mode = os.stat(_config_path()).st_mode & 0o777
+            if mode & 0o077:
+                warn = (f"config file is readable by other users "
+                        f"(mode {mode:03o}); run `chmod 600 {_config_path()}`")
+        except OSError:
+            pass
+    if args.json:
+        _emit_json({"configured": bool(key), "source": source,
+                    "key": mask_key(key) if key else None,
+                    "config_path": _config_path(), "warning": warn})
+        return 0
+    if not key:
+        print("no publisher API key configured")
+        print(f"  set one with `steam-cli auth --set`, or export {API_KEY_ENV}=<key>")
+        print("  get a key at https://partner.steamgames.com "
+              "(Users & Permissions → Manage Web API Keys)")
+        return 0
+    print(f"key:    {mask_key(key)}")
+    print(f"source: {source}")
+    if env_name and file_key:
+        print("        (a key in the config file is being overridden by the "
+              "environment)")
+    if warn:
+        print(f"warning: {warn}")
+    return 0
+
+
+# ----- subcommand: mygames -------------------------------------------------
+# Different endpoint and different concern from the financials below: this
+# just asks Steam which apps the key's account ships.
+
+def cmd_mygames(args) -> int:
+    """Every app the key's account ships — the answer to "which games are mine"."""
+    key = api_key(required_for="mygames")
+    data = http_json(f"{API}/ISteamApps/GetPartnerAppListForWebAPIKey/v2/",
+                     {"key": key, "type_filter": args.type or None},
+                     timeout=args.timeout, insecure=args.insecure,
+                     cache_ttl=DEFAULT_TTL)
+    apps = ((data.get("applist") or {}).get("apps") or {}).get("app") or []
+    items = [{"appid": a.get("appid"), "name": a.get("app_name"),
+              "type": a.get("app_type")} for a in apps]
+    items.sort(key=lambda i: (i["type"] or "", i["name"] or ""))
+    by_type: dict[str, list] = {}
+    for i in items:
+        by_type.setdefault(i["type"] or "unknown", []).append(i)
+    if args.json:
+        _emit_json({"count": len(items), "by_type":
+                    {k: len(v) for k, v in sorted(by_type.items())},
+                    "apps": items})
+        return 0
+    if not items:
+        print("no apps on this key's account "
+              "(is it a publisher key rather than a personal one?)")
+        return 0
+    print(f"{len(items)} app(s) on this account:\n")
+    for kind in sorted(by_type):
+        print(f"  {kind} ({len(by_type[kind])})")
+        for i in by_type[kind]:
+            print(f"    {i['appid']:<10} {i['name']}")
+        print()
+    return 0
+
+
+# ----- partner financials: wishlists & sales -------------------------------
+# IPartnerFinancialsService is NOT listed by GetSupportedAPIList — it has to be
+# known by name (docs: partner.steamgames.com/doc/webapi/IPartnerFinancialsService).
+# Two traps live here, both load-bearing:
+#   * neighbouring methods disagree on timezone — wishlist reporting is GMT,
+#     detailed sales is US Pacific;
+#   * an empty {"response": {}} means "this key lacks the Sales Data permission",
+#     NOT "no sales that day" — reporting it as zero revenue would be a lie.
+# Valve also warns that hammering already-closed dates can get a key restricted,
+# so a settled day is cached hard and only today stays short-lived. That warning
+# is also why a multi-day window walks the days SERIALLY instead of going
+# through _fetch_soft_concurrent like price/overview do: firing 90 dated
+# requests at the financials endpoint at once is exactly the access pattern
+# Valve calls out, and soft-concurrent swallows failures into None — which
+# would turn "this key lost its permission" into a silent zero.
+
+_FINANCIALS_MAX_DAYS = 90        # guard the fan-out: one request per day
+_SETTLED_TTL = 30 * 24 * 3600    # a past day never changes again
+_TODAY_TTL = 900                 # today is still accumulating
+
+
+def _tz_today(tz: str) -> dt.date:
+    """Today's date in the timezone a given financials method reports in."""
+    if tz == "gmt":
+        return dt.datetime.now(dt.timezone.utc).date()
+    # US Pacific. zoneinfo is 3.9+, and the module still supports 3.8, so fall
+    # back to a fixed -8 offset: the only cost is an edge-of-midnight day shift
+    # on a default date, and an explicit --date is unaffected either way.
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("America/Los_Angeles")).date()
+    except Exception:
+        return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=8)).date()
+
+
+def _financial_dates(date: str | None, days: int, tz: str) -> list[str]:
+    """Resolve --date/--days into an explicit list of YYYY-MM-DD strings.
+
+    Default is yesterday, not today: today's numbers are partial, and quietly
+    reporting a half day as a full one invites wrong conclusions.
+    """
+    if days < 1:
+        raise SteamError("--days must be at least 1", code="invalid")
+    if days > _FINANCIALS_MAX_DAYS:
+        raise SteamError(
+            f"--days is capped at {_FINANCIALS_MAX_DAYS} (one request per day, "
+            "and Valve restricts keys that re-query settled dates too often).",
+            code="invalid")
+    if date:
+        try:
+            end = dt.datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise SteamError(f"--date must be YYYY-MM-DD, got {date!r}",
+                             code="invalid") from None
+    else:
+        end = _tz_today(tz) - dt.timedelta(days=1)
+    return [(end - dt.timedelta(days=i)).isoformat() for i in range(days - 1, -1, -1)]
+
+
+def _financials_ttl(date: str, tz: str) -> float:
+    return _TODAY_TTL if date >= _tz_today(tz).isoformat() else _SETTLED_TTL
+
+
+def _partner_financials(method: str, params: dict, *, required_for: str,
+                        date: str, tz: str, timeout: float = 30.0,
+                        insecure: bool = False) -> dict:
+    key = api_key(required_for=required_for)
+    data = http_json(f"{PARTNER_API}/IPartnerFinancialsService/{method}/v001/",
+                     {**params, "key": key, "date": date},
+                     timeout=timeout, insecure=insecure,
+                     cache_ttl=_financials_ttl(date, tz))
+    return data.get("response") or {}
+
+
+def _no_financial_permission() -> SteamError:
+    return SteamError(
+        "Steam returned an empty financials response. That means this key has "
+        "no Sales Data permission — not that there were no sales. In Steamworks "
+        "go to Users & Permissions → Manage Groups, create a Financial API "
+        "Group with the 'Sales Data' permission, and put the key's account in "
+        "it. (Wishlist reporting works without it.)", code="auth")
+
+
+def _wishlist_counts(node: dict) -> dict:
+    """Pull the four wishlist actions out of a summary node as plain ints.
+
+    Steam repeats the same `wishlist_*` shape for the day total, each country
+    and each language, so all three read through here."""
+    return {k: int(node.get(f"wishlist_{k}") or 0)
+            for k in ("adds", "deletes", "purchases", "gifts")}
+
+
+def _top_n(counter: dict, n: int = 10) -> list[tuple]:
+    """Highest-first slice of a {key: count} map, for the text output."""
+    return sorted(counter.items(), key=lambda kv: -kv[1])[:n]
+
+
+def _num(value) -> float:
+    """Steam sends money and counts as strings ("9.9900") — normalise to numbers
+    so a --json consumer can do arithmetic without re-parsing."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def cmd_wishlist(args) -> int:
+    appid = resolve_appid(args.game, quiet=args.quiet, insecure=args.insecure,
+                          timeout=args.timeout)
+    dates = _financial_dates(args.date, args.days, "gmt")
+    days, first_seen = [], None
+    for d in dates:
+        resp = _partner_financials(
+            "GetAppWishlistReporting", {"appid": appid},
+            required_for="wishlist", date=d, tz="gmt",
+            timeout=args.timeout, insecure=args.insecure)
+        if not resp:
+            # Same trap as sales: Steam answers an unpermitted request with an
+            # empty body, and falling through would report a confident "0
+            # wishlist adds" for a game that may be doing fine.
+            raise SteamError(
+                f"Steam returned an empty wishlist response for appid {appid}. "
+                "That means this key can't report on this app — not that "
+                "nobody wishlisted it. Check that the key belongs to the "
+                "account that ships this game (`steam-cli mygames`).",
+                code="auth")
+        s = resp.get("wishlist_summary") or {}
+        day = {"date": d}
+        day.update(_wishlist_counts(s))
+        # Steam only attributes a subset of adds to an OS, so these do NOT sum
+        # to `adds` — kept under their own key to avoid reading as a complete
+        # breakdown.
+        day["adds_by_os"] = {
+            os_name: int(s.get(f"wishlist_adds_{os_name}") or 0)
+            for os_name in ("windows", "mac", "linux")
+        }
+        day["countries"] = [
+            dict(cc=c.get("country_code"), country=c.get("country_name"),
+                 region=c.get("region"),
+                 **_wishlist_counts(c.get("summary_actions") or {}))
+            for c in (resp.get("country_summary") or [])]
+        day["languages"] = [
+            dict(language=l.get("language_name"),
+                 **_wishlist_counts(l.get("summary_actions") or {}))
+            for l in (resp.get("language_summary") or [])]
+        days.append(day)
+        # Constant per app, but take the first non-null rather than the last:
+        # one day's response missing the field must not clobber a good value.
+        first_seen = first_seen or resp.get("app_min_date")
+
+    total = {k: sum(d[k] for d in days)
+             for k in ("adds", "deletes", "purchases", "gifts")}
+    total["net_adds"] = total["adds"] - total["deletes"]
+    out = {"appid": appid, "days": days, "total": total,
+           "data_since": first_seen}
+    if args.json:
+        _emit_json(out)
+        return 0
+    _print_wishlist(out)
+    return 0
+
+
+def _print_wishlist(out: dict) -> None:
+    t = out["total"]
+    span = f'{out["days"][0]["date"]} … {out["days"][-1]["date"]}' \
+        if len(out["days"]) > 1 else out["days"][0]["date"]
+    print(f'wishlist — appid {out["appid"]}  ({span})')
+    print(f'  adds      {t["adds"]:>8}')
+    print(f'  deletes   {t["deletes"]:>8}')
+    print(f'  net       {t["net_adds"]:>8}')
+    print(f'  purchases {t["purchases"]:>8}')
+    print(f'  gifts     {t["gifts"]:>8}')
+    if len(out["days"]) > 1:
+        print("\n  by day:")
+        for d in out["days"]:
+            print(f'    {d["date"]}  +{d["adds"]:<6} -{d["deletes"]:<6} '
+                  f'bought {d["purchases"]}')
+    countries = {}
+    for d in out["days"]:
+        for c in d["countries"]:
+            countries[c["cc"]] = countries.get(c["cc"], 0) + c["adds"]
+    top = _top_n(countries)
+    if top:
+        print("\n  top countries by adds:")
+        for cc, n in top:
+            print(f"    {cc}  {n}")
+    if out.get("data_since"):
+        print(f'\n  (Steam has data for this app since {out["data_since"]})')
+
+
+def cmd_sales(args) -> int:
+    appid = None
+    if args.game:
+        appid = resolve_appid(args.game, quiet=args.quiet,
+                              insecure=args.insecure, timeout=args.timeout)
+    dates = _financial_dates(args.date, args.days, "pacific")
+    days, missing, unresolved = [], [], 0
+    for d in dates:
+        resp = _partner_financials(
+            "GetDetailedSales", {}, required_for="sales", date=d, tz="pacific",
+            timeout=args.timeout, insecure=args.insecure)
+        if not resp:
+            # Recorded rather than dropped: a total summed over 5 of 7 days
+            # looks exactly like a genuine slow week unless we say otherwise.
+            missing.append(d)
+            continue
+        rows = resp.get("detailed_sales") or resp.get("sales") or []
+        apps = {int(a.get("appid")): a.get("app_name")
+                for a in (resp.get("app_info") or []) if a.get("appid")}
+        pkgs = {int(p.get("packageid")): p
+                for p in (resp.get("package_info") or []) if p.get("packageid")}
+        items = []
+        for r in rows:
+            pkg = pkgs.get(int(r.get("packageid") or 0), {})
+            row_app = pkg.get("appid")
+            # GetDetailedSales has no appid filter — it returns the whole
+            # account, so narrowing to one game happens here. A row whose
+            # package doesn't resolve to an app (a bundle, say) is EXCLUDED
+            # rather than kept: "can't prove it belongs to this game" must not
+            # read as "belongs to this game", or another product's revenue
+            # lands in a single-game report.
+            if appid is not None and (row_app is None or int(row_app) != appid):
+                unresolved += 1 if row_app is None else 0
+                continue
+            items.append({
+                "packageid": r.get("packageid"),
+                "package": pkg.get("package_name"),
+                "appid": row_app,
+                "game": apps.get(int(row_app)) if row_app else None,
+                "platform": r.get("platform"),
+                "cc": r.get("country_code"),
+                "units": int(_num(r.get("gross_units_sold"))),
+                "gross_usd": _num(r.get("gross_sales_usd")),
+                "net_usd": _num(r.get("net_sales_usd")),
+            })
+        days.append({
+            "date": d,
+            "units": sum(i["units"] for i in items),
+            "gross_usd": round(sum(i["gross_usd"] for i in items), 2),
+            "net_usd": round(sum(i["net_usd"] for i in items), 2),
+            "rows": items,
+        })
+    if len(missing) == len(dates):
+        raise _no_financial_permission()
+    out = {
+        "appid": appid,
+        "days": days,
+        "missing_dates": missing,     # requested but not returned by Steam
+        "unresolved_rows": unresolved,  # excluded from a --game report
+        "total": {
+            "units": sum(d["units"] for d in days),
+            "gross_usd": round(sum(d["gross_usd"] for d in days), 2),
+            "net_usd": round(sum(d["net_usd"] for d in days), 2),
+        },
+    }
+    if args.json:
+        _emit_json(out)
+        return 0
+    _print_sales(out)
+    return 0
+
+
+def _print_sales(out: dict) -> None:
+    t = out["total"]
+    span = f'{out["days"][0]["date"]} … {out["days"][-1]["date"]}' \
+        if len(out["days"]) > 1 else (out["days"][0]["date"] if out["days"] else "—")
+    print(f"sales  ({span})")
+    print(f'  units      {t["units"]:>10}')
+    print(f'  gross USD  {t["gross_usd"]:>10,.2f}')
+    print(f'  net USD    {t["net_usd"]:>10,.2f}   ← after Steam\'s share/refunds')
+    if out.get("missing_dates"):
+        print(f'\n  ! Steam returned nothing for {len(out["missing_dates"])} '
+              f'of the requested days — the totals above exclude them:')
+        print(f'    {", ".join(out["missing_dates"])}')
+    if out.get("unresolved_rows"):
+        print(f'\n  ! {out["unresolved_rows"]} sales row(s) could not be tied '
+              f'to an app (bundles?) and were left out of this game\'s totals')
+    by_country = {}
+    for d in out["days"]:
+        for r in d["rows"]:
+            by_country[r["cc"]] = by_country.get(r["cc"], 0) + r["units"]
+    top = _top_n(by_country)
+    if top:
+        print("\n  top countries by units:")
+        for cc, n in top:
+            print(f"    {cc}  {n}")
+
+
 # ----- subcommands: specials / top-sellers ---------------------------------
 # Both read the storefront's featuredcategories (key-free, region-curated front
 # page) and surface one section each. Prices are integer minor units (cents).
@@ -2323,6 +2864,53 @@ def build_parser() -> argparse.ArgumentParser:
     ca.add_argument("--json", action="store_true", help="emit raw JSON")
     ca.set_defaults(func=cmd_cache)
 
+    # auth — publisher key configuration. Local-only like `cache`, so the
+    # network flags from add_common don't apply, but --json still must.
+    au = sub.add_parser("auth",
+                        help="configure the optional Steam publisher API key")
+    au.add_argument("--set", action="store_true",
+                    help="store a key read from stdin (never passed as an "
+                         "argument: argv is visible via `ps`)")
+    au.add_argument("--clear", action="store_true",
+                    help="remove the stored key")
+    au.add_argument("--path", action="store_true",
+                    help="print only the config file path")
+    au.add_argument("--json", action="store_true", help="emit raw JSON")
+    au.set_defaults(func=cmd_auth)
+
+    # mygames (publisher key required)
+    mg = sub.add_parser("mygames",
+                        help="apps your publisher key's account ships "
+                             "(needs a publisher API key)")
+    mg.add_argument("--type", help="filter by app type (game, demo, dlc, "
+                                   "music, beta…)")
+    add_common(mg)
+    mg.set_defaults(func=cmd_mygames)
+
+    # wishlist (publisher key required)
+    wl = sub.add_parser("wishlist",
+                        help="wishlist adds/deletes/purchases for YOUR game "
+                             "(needs a publisher API key)")
+    wl.add_argument("game", help="appid or game name (must be yours)")
+    wl.add_argument("--date", help="report day, YYYY-MM-DD in GMT "
+                                   "(default: yesterday)")
+    wl.add_argument("--days", type=int, default=1,
+                    help="aggregate this many days ending at --date (default 1)")
+    add_common(wl)
+    wl.set_defaults(func=cmd_wishlist)
+
+    # sales (publisher key + Sales Data permission required)
+    sl = sub.add_parser("sales",
+                        help="units and revenue for your games (needs a "
+                             "publisher key with the Sales Data permission)")
+    sl.add_argument("--game", help="limit to one appid or game name")
+    sl.add_argument("--date", help="report day, YYYY-MM-DD in US Pacific "
+                                   "(default: yesterday)")
+    sl.add_argument("--days", type=int, default=1,
+                    help="aggregate this many days ending at --date (default 1)")
+    add_common(sl)
+    sl.set_defaults(func=cmd_sales)
+
     # price
     pr = sub.add_parser("price", help="price and discount for one or more regions")
     pr.add_argument("game", help="appid or game name")
@@ -2383,7 +2971,10 @@ def main(argv: list[str] | None = None) -> int:
         # must NOT leave a --json consumer with an empty stdout + traceback:
         # the "--json always yields a JSON object" contract holds even here.
         if getattr(args, "json", False):
-            _emit_json({"error": f"{type(e).__name__}: {e}", "code": "internal"})
+            # Redacted like every other outward-facing message: an unforeseen
+            # exception can carry the requested URL, key and all.
+            _emit_json({"error": _redact(f"{type(e).__name__}: {e}"),
+                        "code": "internal"})
             return 1
         raise
 

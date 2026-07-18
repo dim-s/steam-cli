@@ -129,15 +129,31 @@ steam-cli profile 76561197960287930
 | `profile <id>` | Public Steam Community profile (no key) | `steamcommunity.com/…?xml=1` |
 | `cache [--path/--clear]` | Inspect or clear the on-disk cache | — (local) |
 
+### Publisher-key subcommands (optional, for your own games)
+
+These need a Steam **publisher** Web API key and only report on games the
+key's account ships. Everything above stays key-free.
+
+| Command | Purpose | Steam endpoint |
+|---|---|---|
+| `auth [--set/--clear/--path]` | Configure the key (`--set` reads stdin) | — (local) |
+| `mygames [--type game]` | Every app on your account, grouped by type | `ISteamApps/GetPartnerAppListForWebAPIKey` |
+| `wishlist <game>` | Wishlist adds/deletes/purchases per day, by country, language, OS | `IPartnerFinancialsService/GetAppWishlistReporting` |
+| `sales [--game X]` | Units + gross/net USD by package, platform, country | `IPartnerFinancialsService/GetDetailedSales` |
+
+See [For game owners](#for-game-owners-the-optional-publisher-key) below for
+how to get a key and which permissions each command needs.
+
 Add `--json` to any subcommand for raw structured output (ideal for scripts
 and agents). Add `-q/--quiet` to suppress the appid-resolution note. All
 subcommands accept `--timeout SECS` (default 30) and retry transient HTTP
 429/5xx and network errors automatically with backoff.
 
 Under `--json`, failures are reported as a JSON object on **stdout** —
-`{"error": "<message>", "code": "<not_found|http|network|parse>"}` — with a
+`{"error": "<message>", "code": "<not_found|http|network|parse|auth>"}` — with a
 non-zero exit code, so a parser always gets valid JSON instead of an empty
-stream.
+stream. (`auth` = a publisher-key command ran without a key, or the key lacks
+the permission that call needs.)
 
 ### `reviews` options
 
@@ -218,11 +234,67 @@ the request through the system `curl` (which uses the OS trust store), so it
 keeps working on such machines. Force a backend with
 `STEAM_CLI_HTTP=urllib|curl`, or pass `-k/--insecure` to skip verification.
 
+## For game owners: the optional publisher key
+
+Everything above works **without any API key** — that hasn't changed. If you
+ship games on Steam, adding your own *publisher* Web API key unlocks a second
+set of commands about **your own** games.
+
+```bash
+# store the key (read from stdin, never from an argument)
+steam-cli auth --set
+steam-cli auth                 # shows a mask + where the key came from
+
+steam-cli mygames --json                       # your apps, grouped by type
+steam-cli wishlist "My Game" --days 30 --json  # wishlist adds/deletes/purchases
+steam-cli sales --days 7 --json                # units + gross/net revenue
+```
+
+Or set `STEAM_CLI_API_KEY` in the environment (`STEAM_API_KEY` also works) —
+handy for CI and agents.
+
+**There is deliberately no `--api-key` flag.** A key passed as a command-line
+argument is visible to every other user on the machine through `ps` and stays
+in your shell history; `auth --set` reads it from stdin and stores it `0600`
+instead. The key is also stripped from cache metadata, cache filenames, error
+messages, and the `curl` command line, so it can't leak through a bug report.
+
+### Getting a key, and the permission trap
+
+1. [Steamworks](https://partner.steamgames.com) → **Users & Permissions** →
+   **Manage Web API Keys** → create a key for your publisher group.
+2. `wishlist` and `mygames` work with that key as-is.
+3. **`sales` needs one more thing, and it is not the "Financial" checkbox on
+   the key.** Go to **Users & Permissions → Manage Groups**, create a
+   **Financial API Group** with the **Sales Data** permission, and put the
+   key's account in it. Without it Steam returns an *empty* response, which
+   `steam-cli` reports as an `auth` error rather than as "zero sales" — an
+   empty answer must never be mistaken for no revenue.
+
+### Two gotchas worth knowing
+
+- **The two reports use different timezones.** `wishlist` dates are **GMT**,
+  `sales` dates are **US Pacific** — comparing a day of one against a day of
+  the other is off by up to eight hours.
+- **`--days N` costs N requests.** Settled days are cached hard (Valve warns
+  that re-querying closed dates can get a key restricted), today is cached
+  briefly, and the window is capped at 90 days.
+
+### Still not available, at any permission level
+
+- **A wishlist count for a game you don't ship** — doesn't exist. The wishlist
+  API only reports on your own apps.
+- **Store page traffic, impressions and UTM stats** — Steamworks web UI only.
+- Note also that `ISteamWebAPIUtil/GetSupportedAPIList` does **not** list every
+  interface (`IPartnerFinancialsService` is absent from it entirely), so an
+  endpoint missing from that list is not proof it doesn't exist.
+
 ## Notes & limits
 
-- **No API key** — only Steam's public, key-free endpoints are used. Player
-  profiles, a user's owned-games library, and per-user achievements need a
-  Steam Web API key and are intentionally out of scope.
+- **No API key needed** — the whole tool works on Steam's public, key-free
+  endpoints. A publisher key is optional and only adds data about your own
+  games (see above). Reading *another* user's owned-games library or private
+  profile stays intentionally out of scope.
 - **Name resolution picks the top store-search hit** — `"Hades"` may resolve
   to *Hades II*. Pass an explicit appid (or check `steam-cli search`) when it
   matters; the resolved appid is always printed to stderr.
@@ -237,9 +309,11 @@ keeps working on such machines. Force a backend with
 - **`overview --estimate` is a Boxleiter heuristic** (owners ≈ reviews ×
   multiplier), reported as a range — order-of-magnitude only, not a Steam
   figure.
-- **Wishlists, followers, and historical player/price curves are not
-  available** key-free (they live only in SteamDB or the Steamworks partner
-  backend). `history` (review velocity) is the nearest public momentum proxy.
+- **Followers and historical player/price curves are not available** key-free
+  (they live only in SteamDB or the Steamworks partner backend). `history`
+  (review velocity) is the nearest public momentum proxy. **Wishlists are the
+  exception**: for *your own* games they are real data via `wishlist` and a
+  publisher key — for anyone else's, they remain unavailable.
 
 ## Use it from an AI agent
 

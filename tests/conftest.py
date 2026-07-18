@@ -55,6 +55,11 @@ def reset_http_state(monkeypatch, tmp_path):
     The on-disk cache is disabled by default and pointed at a per-test tmp dir,
     so command tests neither read a developer's real cache nor write to disk.
     Cache tests opt in by setting `_CACHE.enabled = True`.
+
+    The publisher API key is isolated the same way: the environment variables are
+    cleared and the config path is redirected into tmp, so a developer running
+    the suite on a machine with a real key configured neither leaks it into a
+    test nor has `auth` tests overwrite their actual config.
     """
     import steam_cli
     monkeypatch.setattr(steam_cli, "_curl_fallback", False)
@@ -64,3 +69,6 @@ def reset_http_state(monkeypatch, tmp_path):
     monkeypatch.setattr(steam_cli._CACHE, "dir", str(tmp_path / "cache"))
     monkeypatch.setattr(steam_cli._CACHE, "ttl_override", None)
     monkeypatch.setattr(steam_cli._CACHE, "force_refresh", False)
+    monkeypatch.delenv(steam_cli.API_KEY_ENV, raising=False)
+    monkeypatch.delenv(steam_cli.API_KEY_ENV_ALIAS, raising=False)
+    monkeypatch.setenv("STEAM_CLI_CONFIG", str(tmp_path / "config" / "config.json"))
